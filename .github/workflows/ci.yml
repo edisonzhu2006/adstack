@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        sanitize: [none, address]
+        exclude:
+          - os: macos-latest
+            sanitize: address
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ninja
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y ninja-build; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install ninja; fi
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DADSTACK_SANITIZE=${{ matrix.sanitize }}
+      - name: Build
+        run: cmake --build build
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Smoke (gen -> oracle -> streamkit -> compare)
+        run: bash bench/smoke.sh build 200000
