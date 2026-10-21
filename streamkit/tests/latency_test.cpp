@@ -59,6 +59,7 @@ TEST(Latency, SummaryOfEmptyAndUnsortedInput) {
   std::vector<uint32_t> none;
   const LatencySummary e = summarize_latency(none);
   EXPECT_EQ(e.count, 0u);
+  EXPECT_EQ(e.min_us, 0u);
   EXPECT_EQ(e.p50_us, 0u);
   EXPECT_EQ(e.p99_us, 0u);
   EXPECT_EQ(e.max_us, 0u);
@@ -66,6 +67,7 @@ TEST(Latency, SummaryOfEmptyAndUnsortedInput) {
   std::vector<uint32_t> v = {900, 5, 300, 7, 100, 2, 50, 1, 10, 20};  // 10 samples, unsorted
   const LatencySummary s = summarize_latency(v);
   EXPECT_EQ(s.count, 10u);
+  EXPECT_EQ(s.min_us, 1u);
   EXPECT_EQ(s.p50_us, 10u);   // sorted: 1 2 5 7 10 20 50 100 300 900; rank ceil(5) = 5th
   EXPECT_EQ(s.p99_us, 900u);  // rank ceil(9.9) = 10th
   EXPECT_EQ(s.max_us, 900u);
@@ -128,9 +130,33 @@ TEST(Latency, OneSamplePerWatermarkClosedWindowAndNoneAtEndOfInput) {
   ASSERT_TRUE(r.error.empty()) << r.error;
   EXPECT_EQ(total_windows(r), 5u);          // all five minutes produce a row
   EXPECT_EQ(r.emit_latency_us.size(), 4u);  // but only four were closed by the watermark
+  EXPECT_EQ(r.input_reads, 1u);             // 5 records: one read(2) returned them all
   // The whole run takes milliseconds, so no sample can be more than a few
   // seconds; the bound is loose on purpose (sanitizer builds are slow).
   for (uint32_t us : r.emit_latency_us) EXPECT_LT(us, 10u * 1'000'000u);
+
+  fs::remove(in);
+  fs::remove(out);
+}
+
+TEST(Latency, InputReadsCountsBlocksOnAFile) {
+  // 21,000 records = 1,092,000 bytes, more than the reader's 1 MiB block, so
+  // at least two read(2) calls must have returned data; and far fewer than
+  // one per record, which is what a pipe would show.
+  const std::string in = scratch("in.ads");
+  const std::string out = scratch("out.csv");
+  write_minutes(in, 1, 21'000);
+
+  Config cfg;
+  cfg.in_path = in;
+  cfg.out_path = out;
+  cfg.threads = 2;
+
+  PipelineResult r = run_pipeline(cfg);
+  ASSERT_TRUE(r.error.empty()) << r.error;
+  EXPECT_EQ(r.events, 21'000u);
+  EXPECT_GE(r.input_reads, 2u);
+  EXPECT_LE(r.input_reads, 4u);
 
   fs::remove(in);
   fs::remove(out);

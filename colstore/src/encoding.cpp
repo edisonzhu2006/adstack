@@ -107,6 +107,54 @@ void write_dictionary(const Dictionary& dict, ColumnType type, std::vector<uint8
 
 }  // namespace
 
+// ---- 64-bit view of a PLAIN buffer ----------------------------------------------
+
+namespace {
+
+template <typename T>
+void widen_typed(const uint8_t* bytes, size_t n, std::vector<uint64_t>& out) {
+  out.resize(n);
+  for (size_t i = 0; i < n; ++i) {
+    T v;
+    std::memcpy(&v, bytes + i * sizeof(T), sizeof(T));
+    out[i] = widen(v);
+  }
+}
+
+// The buffer holds n values of T back to back (what ColWriter fills), so
+// a typed view of it is a copy into a vector<T>; min_max_bits() then runs
+// its usual std::minmax_element. The copy is one memcpy of the chunk.
+template <typename T>
+void min_max_typed(const uint8_t* bytes, size_t n, uint64_t& min_bits, uint64_t& max_bits) {
+  std::vector<T> values(n);
+  if (n > 0) std::memcpy(values.data(), bytes, n * sizeof(T));
+  min_max_bits(values, min_bits, max_bits);
+}
+
+}  // namespace
+
+void widen_bytes(ColumnType type, const uint8_t* bytes, size_t n, std::vector<uint64_t>& out) {
+  switch (type) {
+    case ColumnType::U8: widen_typed<uint8_t>(bytes, n, out); return;
+    case ColumnType::U16: widen_typed<uint16_t>(bytes, n, out); return;
+    case ColumnType::U32: widen_typed<uint32_t>(bytes, n, out); return;
+    case ColumnType::U64: widen_typed<uint64_t>(bytes, n, out); return;
+    case ColumnType::I64: widen_typed<int64_t>(bytes, n, out); return;
+  }
+  throw std::invalid_argument("widen_bytes: bad column type");
+}
+
+void min_max_bytes(ColumnType type, const uint8_t* bytes, size_t n, uint64_t& min_bits, uint64_t& max_bits) {
+  switch (type) {
+    case ColumnType::U8: min_max_typed<uint8_t>(bytes, n, min_bits, max_bits); return;
+    case ColumnType::U16: min_max_typed<uint16_t>(bytes, n, min_bits, max_bits); return;
+    case ColumnType::U32: min_max_typed<uint32_t>(bytes, n, min_bits, max_bits); return;
+    case ColumnType::U64: min_max_typed<uint64_t>(bytes, n, min_bits, max_bits); return;
+    case ColumnType::I64: min_max_typed<int64_t>(bytes, n, min_bits, max_bits); return;
+  }
+  throw std::invalid_argument("min_max_bytes: bad column type");
+}
+
 // ---- Dictionary -----------------------------------------------------------------
 
 unsigned Dictionary::bit_width_for_count(size_t count) {

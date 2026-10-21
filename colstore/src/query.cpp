@@ -9,7 +9,6 @@
 #include <stdexcept>
 #include <thread>
 
-#include "common/event.h"
 #include "src/encoding.h"  // less_in_type
 #include "src/reader.h"
 
@@ -63,16 +62,21 @@ std::vector<OrderSpec> effective_order(const QueryPlan& plan, const std::vector<
 QueryResult run_aggregate_query(const std::string& col_path, const QueryPlan& plan) {
   if (plan.threads == 0) throw std::invalid_argument("threads must be >= 1");
   const auto t0 = std::chrono::steady_clock::now();
-  const std::vector<OutputColumn> schema = output_columns(plan.group, plan.aggs);  // validates names
+  const std::vector<OutputColumn> schema = output_columns(plan.group, plan.aggs, plan.schema);  // validates names
   for (const OrderSpec& o : plan.order) {
     if (o.column >= schema.size()) throw std::invalid_argument("order column out of range");
+  }
+  // The plan names columns of plan.schema; the file must be that table.
+  // (Each thread reopens the file below; this open is for the check only.)
+  if (ColReader(col_path).schema() != plan.schema) {
+    throw std::invalid_argument("query plan was parsed against a different schema than " + col_path + " has");
   }
 
   // One aggregate per thread; thread 0 is the one everything merges into.
   const unsigned T = plan.threads;
   std::vector<HashAggregate> aggs;
   aggs.reserve(T);
-  for (unsigned t = 0; t < T; ++t) aggs.emplace_back(plan.group, plan.aggs);
+  for (unsigned t = 0; t < T; ++t) aggs.emplace_back(plan.group, plan.aggs, plan.schema);
   std::vector<QueryStats> stats(T);
 
   QueryResult r;
@@ -135,9 +139,14 @@ void write_csv(FILE* out, const QueryResult& r) {
 std::string describe(const QueryResult& r) {
   char buf[256];
   std::string s = describe(r.scan);  // the scan lines (groups skipped, rows, chunks, scan time)
+  // `slots` is thread 0's table (the one everything merged into); doublings
+  // and probes are summed over every thread's table plus the merge, so at T
+  // threads a query that doubles 8 times per table reports 8 * T. Saying
+  // so on the line stops "64 doublings of a 262,144-slot table" reading as
+  // a growth bug.
   std::snprintf(buf, sizeof buf,
                 "\naggregate: %zu groups, %llu rows in %llu batches; table %zu slots, %zu doublings, "
-                "%.2f probes per row",
+                "%.2f probes per row (doublings and probes summed over all threads' tables and the merge)",
                 r.agg.groups, static_cast<unsigned long long>(r.agg.rows),
                 static_cast<unsigned long long>(r.agg.batches), r.agg.slots, r.agg.grows,
                 r.agg.rows ? static_cast<double>(r.agg.probes) / static_cast<double>(r.agg.rows) : 0.0);
@@ -156,30 +165,31 @@ namespace {
 using KeyBits = std::vector<uint64_t>;   // group column patterns
 using Cells = std::vector<uint64_t>;     // one per aggregate, same representation as the table
 
-// Plain per-event update written independently of HashAggregate: signed
-// compares through less_in_type, no order keys, no packing.
-void brute_update(const QueryPlan& plan, const adstack::Event& e, Cells& cells) {
+// Plain per-row update written independently of HashAggregate: signed
+// compares through less_in_type, no order keys, no packing. `row` is one
+// widened pattern per column, straight from the RowSource.
+void brute_update(const QueryPlan& plan, const uint64_t* row, Cells& cells) {
   for (size_t a = 0; a < plan.aggs.size(); ++a) {
     const AggSpec& s = plan.aggs[a];
-    const uint64_t v = s.col ? event_field_bits(e, *s.col) : 0;
-    const bool pass = s.cond ? s.cond->matches(event_field_bits(e, s.cond->col)) : true;
+    const uint64_t v = s.col ? row[column_index(*s.col)] : 0;
+    const bool pass = s.cond ? s.cond->matches(row[column_index(s.cond->col)]) : true;
     switch (s.kind) {
       case AggKind::Count: cells[a] += 1; break;
       case AggKind::CountIf: cells[a] += pass ? 1 : 0; break;
       case AggKind::Sum: cells[a] += v; break;
       case AggKind::SumIf: cells[a] += pass ? v : 0; break;
-      case AggKind::Min: if (less_in_type(v, cells[a], column_spec(*s.col).type)) cells[a] = v; break;
-      case AggKind::Max: if (less_in_type(cells[a], v, column_spec(*s.col).type)) cells[a] = v; break;
+      case AggKind::Min: if (less_in_type(v, cells[a], s.col_type)) cells[a] = v; break;
+      case AggKind::Max: if (less_in_type(cells[a], v, s.col_type)) cells[a] = v; break;
     }
   }
 }
 
-Cells brute_initial(const QueryPlan& plan, const adstack::Event& first) {
+Cells brute_initial(const QueryPlan& plan, const uint64_t* first) {
   Cells c(plan.aggs.size(), 0);
   for (size_t a = 0; a < plan.aggs.size(); ++a) {
     const AggSpec& s = plan.aggs[a];
     // MIN / MAX start at the first value of the group, the textbook way.
-    if (s.kind == AggKind::Min || s.kind == AggKind::Max) c[a] = event_field_bits(first, *s.col);
+    if (s.kind == AggKind::Min || s.kind == AggKind::Max) c[a] = first[column_index(*s.col)];
   }
   return c;
 }
@@ -202,23 +212,33 @@ std::string engine_row_text(const ResultTable& t, uint32_t row) {
 }  // namespace
 
 CheckReport check_against_ads(const std::string& ads_path, const QueryPlan& plan, const QueryResult& r) {
+  AdsRowSource rows(ads_path);
+  return check_against_rows(rows, plan, r);
+}
+
+CheckReport check_against_csv(const std::string& csv_path, const QueryPlan& plan, const QueryResult& r) {
+  CsvRowSource rows(csv_path, plan.schema);
+  return check_against_rows(rows, plan, r);
+}
+
+CheckReport check_against_rows(RowSource& rows, const QueryPlan& plan, const QueryResult& r) {
   const auto t0 = std::chrono::steady_clock::now();
   CheckReport rep;
   const ResultTable& t = r.table;
   const size_t ng = plan.group.size();
+  if (rows.schema() != plan.schema) throw std::invalid_argument("check: the row source is not the plan's table");
 
-  // 1. Brute force: every event, std::map keyed by the group values.
+  // 1. Brute force: every row, std::map keyed by the group values.
   std::map<KeyBits, Cells> truth;
   {
-    adstack::EventReader ads(ads_path);
-    adstack::Event e;
+    std::vector<uint64_t> row;
     KeyBits key(ng);
-    while (ads.next(e)) {
-      if (!matches_all(plan.where, e)) continue;
-      for (size_t c = 0; c < ng; ++c) key[c] = event_field_bits(e, plan.group[c]);
+    while (rows.next(row)) {
+      if (!matches_row(plan.where, row.data())) continue;
+      for (size_t c = 0; c < ng; ++c) key[c] = row[column_index(plan.group[c])];
       auto it = truth.find(key);
-      if (it == truth.end()) it = truth.emplace(key, brute_initial(plan, e)).first;
-      brute_update(plan, e, it->second);
+      if (it == truth.end()) it = truth.emplace(key, brute_initial(plan, row.data())).first;
+      brute_update(plan, row.data(), it->second);
     }
   }
 
@@ -254,9 +274,9 @@ CheckReport check_against_ads(const std::string& ads_path, const QueryPlan& plan
   //    straightforward comparator (no heap, no partial sort).
   const std::vector<OrderSpec> order = effective_order(plan, t.schema);
   if (!order.empty()) {
-    std::vector<std::pair<KeyBits, Cells>> rows(truth.begin(), truth.end());
+    std::vector<std::pair<KeyBits, Cells>> sorted(truth.begin(), truth.end());
     auto value = [&](const std::pair<KeyBits, Cells>& x, size_t c) { return c < ng ? x.first[c] : x.second[c - ng]; };
-    std::stable_sort(rows.begin(), rows.end(), [&](const auto& a, const auto& b) {
+    std::stable_sort(sorted.begin(), sorted.end(), [&](const auto& a, const auto& b) {
       for (const OrderSpec& o : order) {
         const uint64_t va = value(a, o.column), vb = value(b, o.column);
         if (va == vb) continue;
@@ -265,7 +285,7 @@ CheckReport check_against_ads(const std::string& ads_path, const QueryPlan& plan
       }
       return false;
     });
-    const size_t want = (plan.limit == 0 || plan.limit > rows.size()) ? rows.size() : plan.limit;
+    const size_t want = (plan.limit == 0 || plan.limit > sorted.size()) ? sorted.size() : plan.limit;
     if (r.rows.size() != want) {
       rep.detail += "; emitted " + std::to_string(r.rows.size()) + " rows, expected " + std::to_string(want);
       rep.ok = false;
@@ -275,9 +295,9 @@ CheckReport check_against_ads(const std::string& ads_path, const QueryPlan& plan
     for (size_t i = 0; i < want; ++i) {
       const uint32_t row = r.rows[i];
       for (size_t c = 0; c < t.schema.size(); ++c) {
-        if (t.at(c, row) != value(rows[i], c)) {
+        if (t.at(c, row) != value(sorted[i], c)) {
           rep.detail += "; output row " + std::to_string(i) + " differs: engine " + engine_row_text(t, row) +
-                        " vs brute force " + row_text(t, rows[i].first, rows[i].second);
+                        " vs brute force " + row_text(t, sorted[i].first, sorted[i].second);
           rep.seconds = seconds_since(t0);
           return rep;
         }

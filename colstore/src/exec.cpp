@@ -16,7 +16,22 @@ Scanner::Scanner(const ColReader& reader, Conjunction where, std::vector<ColumnI
       group_stride_(group_stride) {
   if (batch_rows_ == 0) throw std::invalid_argument("Scanner: batch_rows must be > 0");
   if (group_stride_ == 0) throw std::invalid_argument("Scanner: group_stride must be > 0");
-  for (ColumnId c : project) projected_[static_cast<size_t>(c)] = true;
+  const Schema& schema = reader_.schema();
+  projected_.assign(schema.size(), 0);
+  cols_.resize(schema.size());
+  for (ColumnId c : project) {
+    if (column_index(c) >= schema.size()) throw std::invalid_argument("Scanner: projected column outside the schema");
+    projected_[column_index(c)] = 1;
+  }
+  // A predicate carries the column it was parsed against; the file must
+  // have that column at that index with that type, or the comparison would
+  // be on the wrong bytes.
+  for (const Predicate& p : where_) {
+    if (column_index(p.col) >= schema.size() || spec_of(schema, p.col).type != p.type ||
+        spec_of(schema, p.col).name != p.column_name) {
+      throw std::invalid_argument("Scanner: predicate on '" + p.column_name + "' was built against a different schema");
+    }
+  }
   // Groups this scanner owns, so the per-thread totals add up to the file's.
   const size_t n = reader_.num_row_groups();
   stats_.row_groups_total = first_group >= n ? 0 : (n - first_group + group_stride_ - 1) / group_stride_;
@@ -38,7 +53,8 @@ bool Scanner::next(Batch& out) {
 
   out.first_row = next_row_;
   out.n = std::min(batch_rows_, group_rows_ - next_row_);
-  for (size_t c = 0; c < kNumColumns; ++c) out.cols[c] = slice(static_cast<ColumnId>(c), next_row_);
+  out.cols.resize(cols_.size());
+  for (size_t c = 0; c < cols_.size(); ++c) out.cols[c] = slice(column_id(c), next_row_);
   out.predicates = &compiled_;
   out.filtered = false;
   out.sel.clear();
@@ -79,8 +95,8 @@ bool Scanner::load_row_group(size_t g) {
   }
 
   // 3. Projected columns not already decoded for filtering.
-  for (size_t c = 0; c < kNumColumns; ++c) {
-    if (projected_[c] && !cols_[c].loaded) decode_column(g, static_cast<ColumnId>(c));
+  for (size_t c = 0; c < cols_.size(); ++c) {
+    if (projected_[c] && !cols_[c].loaded) decode_column(g, column_id(c));
   }
   ++stats_.row_groups_scanned;
   return true;
@@ -88,11 +104,14 @@ bool Scanner::load_row_group(size_t g) {
 
 void Scanner::decode_column(size_t g, ColumnId col) {
   const ChunkMeta& m = reader_.chunk(g, col);
-  const ColumnType type = column_spec(col).type;
+  const ColumnType type = spec_of(reader_.schema(), col).type;
   const std::vector<uint8_t> bytes = reader_.read_chunk_bytes(g, col);
   DecodedColumn& dc = cols_[static_cast<size_t>(col)];
-  const auto enc = static_cast<Encoding>(m.encoding);
+  // Check the id before naming it as an Encoding, so the guard reads as
+  // guarding the cast (the cast itself is well-defined either way: Encoding
+  // has a fixed uint32_t underlying type).
   if (m.encoding >= kNumEncodings) throw std::runtime_error("unsupported encoding id " + std::to_string(m.encoding));
+  const auto enc = static_cast<Encoding>(m.encoding);
 
   // Dictionary-coded chunks stay as codes: cheaper to filter (compare
   // small ints, no lookup) and no cheaper to expand later than now.
@@ -115,7 +134,7 @@ void Scanner::decode_column(size_t g, ColumnId col) {
 
 bool Scanner::compile_predicate(const Predicate& p, CompiledPredicate& out) {
   const DecodedColumn& dc = cols_[static_cast<size_t>(p.col)];
-  const ColumnType type = column_spec(p.col).type;
+  const ColumnType type = p.type;
   out.col = p.col;
   if (!dc.on_codes) {
     out.on_codes = false;
@@ -205,8 +224,9 @@ void apply_filter(Batch& batch) {
 // ---- project ------------------------------------------------------------------------
 
 void gather(const Batch& batch, ColumnId col, std::vector<uint64_t>& out) {
-  const ColumnVector& cv = batch.cols[static_cast<size_t>(col)];
-  if (!cv.loaded()) throw std::invalid_argument(std::string("gather: column not projected: ") + column_spec(col).name);
+  if (column_index(col) >= batch.cols.size()) throw std::invalid_argument("gather: column outside the batch's schema");
+  const ColumnVector& cv = batch.cols[column_index(col)];
+  if (!cv.loaded()) throw std::invalid_argument("gather: column not projected: index " + std::to_string(column_index(col)));
   const uint32_t n = batch.selected();
   out.resize(n);
   for (uint32_t k = 0; k < n; ++k) out[k] = cv.at(batch.row(k));

@@ -59,8 +59,9 @@ namespace colstore {
 
 class KeyPacker {
  public:
-  // Throws std::invalid_argument when the columns do not fit in 128 bits.
-  explicit KeyPacker(std::vector<ColumnId> cols);
+  // Throws std::invalid_argument when the columns do not fit in 128 bits,
+  // std::out_of_range when one is not in the schema.
+  explicit KeyPacker(std::vector<ColumnId> cols, const Schema& schema = event_schema());
 
   const std::vector<ColumnId>& columns() const { return cols_; }
   GroupKey pack(const Batch& b, uint32_t row) const;
@@ -88,6 +89,8 @@ const char* agg_kind_name(AggKind k);
 struct AggSpec {
   AggKind kind = AggKind::Count;
   std::optional<ColumnId> col;     // Sum, Min, Max, SumIf: the column aggregated
+  ColumnType col_type = ColumnType::U64;  // its type and name, copied from the schema the spec was
+  std::string col_name;                   //   parsed against (same reason as Predicate); unset without col
   std::optional<Predicate> cond;   // CountIf, SumIf: counted/summed only when true
   std::string name;                // output column name (default or AS alias)
 
@@ -103,9 +106,9 @@ struct AggSpec {
 //   pred := one --where term, e.g. event_type=1 or cost_micros BETWEEN 1 AND 9
 //
 // Default names: count, sum_<col>, min_<col>, max_<col>,
-// count_if_<col>_<op>_<value>, sum_if_<col>_<cond>. Throws
-// std::invalid_argument naming the offending token.
-std::vector<AggSpec> parse_aggs(std::string_view text);
+// count_if_<col>_<op>_<value>, sum_if_<col>_<cond>. Column names resolve
+// against `schema`. Throws std::invalid_argument naming the offending token.
+std::vector<AggSpec> parse_aggs(std::string_view text, const Schema& schema = event_schema());
 std::string to_string(const AggSpec& a);
 
 // Type of an aggregate's output: count -> u64; sum -> i64 for a signed
@@ -120,10 +123,11 @@ struct OutputColumn {
   bool operator==(const OutputColumn&) const = default;
 };
 
-// Group columns first (their own names and types), then one column per
-// aggregate. Throws std::invalid_argument on a duplicate name, because
-// ORDER BY resolves names against this list.
-std::vector<OutputColumn> output_columns(const std::vector<ColumnId>& group, const std::vector<AggSpec>& aggs);
+// Group columns first (their own names and types, from `schema`), then one
+// column per aggregate. Throws std::invalid_argument on a duplicate name,
+// because ORDER BY resolves names against this list.
+std::vector<OutputColumn> output_columns(const std::vector<ColumnId>& group, const std::vector<AggSpec>& aggs,
+                                         const Schema& schema = event_schema());
 
 // Columnar result: cols[c][r] is the raw 64-bit pattern of row r in output
 // column c, formatted with schema[c].type.
@@ -151,8 +155,9 @@ struct AggStats {
 
 class HashAggregate {
  public:
-  // An empty `group` means one global group (plain COUNT / SUM).
-  HashAggregate(std::vector<ColumnId> group, std::vector<AggSpec> aggs);
+  // An empty `group` means one global group (plain COUNT / SUM). `schema`
+  // is the table the batches come from; group columns are resolved in it.
+  HashAggregate(std::vector<ColumnId> group, std::vector<AggSpec> aggs, const Schema& schema = event_schema());
 
   // Every column the batches must have loaded: group columns, aggregated
   // columns and condition columns. This is the Scanner's project list.
@@ -181,6 +186,7 @@ class HashAggregate {
   void combine(uint32_t group, size_t a, uint64_t other);  // merge one cell
   static uint64_t initial_state(const AggSpec& a);
 
+  Schema schema_;
   KeyPacker packer_;
   std::vector<AggSpec> aggs_;
   std::vector<Column> agg_cols_;

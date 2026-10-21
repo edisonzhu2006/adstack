@@ -113,11 +113,21 @@ std::vector<T> narrow_all(const std::vector<uint64_t>& in) {
   return out;
 }
 
+// The same widening from a PLAIN byte buffer: n values of the column's
+// natural width, little-endian (what ColWriter buffers and a PLAIN chunk
+// holds). The type is a run-time value here because the writer handles
+// any schema; the switch dispatches once per chunk, not per value.
+void widen_bytes(ColumnType type, const uint8_t* bytes, size_t n, std::vector<uint64_t>& out);
+
 // Compares two 64-bit patterns in the column's natural order.
 inline bool less_in_type(uint64_t a, uint64_t b, ColumnType type) {
   if (is_signed(type)) return as_signed(a) < as_signed(b);
   return a < b;
 }
+
+// min_max_bits() for a PLAIN byte buffer of a run-time type: the same
+// typed std::minmax_element pass, dispatched once per chunk.
+void min_max_bytes(ColumnType type, const uint8_t* bytes, size_t n, uint64_t& min_bits, uint64_t& max_bits);
 
 // Min and max of a chunk as the raw 8-byte form stored in ChunkMeta.
 // Signed values are sign-extended so as_signed() recovers them; unsigned

@@ -20,11 +20,12 @@
 //      tiebreak so the output is identical at any thread count. Without
 //      either, rows come out in the order the groups were first seen.
 //
-// Verification (--check events.ads): the same plan is evaluated by a loop
-// over every event of the .ads file with a std::map keyed by the group
-// values, nothing shared with the hash table or the scanner, and the two
-// result sets are compared group by group; with an ORDER BY / LIMIT the
-// emitted rows are also compared with the brute-force rows under a plain
+// Verification (--check events.ads, --check-csv aggregates.csv): the same
+// plan is evaluated by a loop over every row of the ORIGINAL input (a
+// RowSource, row_source.h) with a std::map keyed by the group values,
+// nothing shared with the hash table or the scanner, and the two result
+// sets are compared group by group; with an ORDER BY / LIMIT the emitted
+// rows are also compared with the brute-force rows under a plain
 // std::sort.
 
 #include <cstdint>
@@ -35,11 +36,15 @@
 #include "src/aggregate.h"
 #include "src/exec.h"
 #include "src/predicate.h"
+#include "src/row_source.h"
 #include "src/sort.h"
 
 namespace colstore {
 
 struct QueryPlan {
+  // The table the plan was parsed against (where, group, aggs name its
+  // columns). run_aggregate_query() refuses a file with another schema.
+  Schema schema = event_schema();
   Conjunction where;
   std::vector<ColumnId> group;     // empty: one global group
   std::vector<AggSpec> aggs;
@@ -61,7 +66,8 @@ struct QueryResult {
   double total_seconds = 0;
 };
 
-// Throws std::invalid_argument on a bad plan, std::runtime_error on I/O.
+// Throws std::invalid_argument on a bad plan or a plan for another schema,
+// std::runtime_error on I/O.
 QueryResult run_aggregate_query(const std::string& col_path, const QueryPlan& plan);
 
 // The ORDER BY actually applied: plan.order plus every group column not
@@ -79,6 +85,11 @@ struct CheckReport {
   std::string detail;   // what was compared, and the first difference if any
   double seconds = 0;   // brute-force time
 };
+// `rows` must yield plan.schema rows (checked). The two names below open
+// the source for you: an .ads file for an event-table plan, a streamkit
+// CSV for an aggregate-table plan.
+CheckReport check_against_rows(RowSource& rows, const QueryPlan& plan, const QueryResult& r);
 CheckReport check_against_ads(const std::string& ads_path, const QueryPlan& plan, const QueryResult& r);
+CheckReport check_against_csv(const std::string& csv_path, const QueryPlan& plan, const QueryResult& r);
 
 }  // namespace colstore

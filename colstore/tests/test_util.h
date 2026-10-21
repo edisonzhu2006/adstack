@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <random>
 #include <string>
 
 #include "common/event.h"
@@ -27,10 +28,27 @@ inline adstack::Event sample_event(uint64_t i) {
   return e;
 }
 
+// A token that is the same for every TempFile in one process and (with
+// overwhelming probability) different between processes. It goes into every
+// temp file name because ctest runs each gtest case as its own PROCESS, and
+// with `ctest -j N` several of them run at once: two QueryFiles fixtures in
+// two processes both naming their file "query.col" would create and delete
+// each other's data. A fixed name was fine for the single-process run of
+// `colstore_tests` and only broke under parallel ctest, which is why this
+// is a function of the process and not of the test. std::random_device is
+// used instead of getpid() to keep the tests on the standard library alone.
+inline const std::string& process_token() {
+  static const std::string token = [] {
+    std::random_device rd;
+    return std::to_string((static_cast<uint64_t>(rd()) << 32) | rd());
+  }();
+  return token;
+}
+
 class TempFile {
  public:
   explicit TempFile(const std::string& name)
-      : path_((std::filesystem::temp_directory_path() / ("colstore_test_" + name)).string()) {
+      : path_((std::filesystem::temp_directory_path() / ("colstore_test_" + process_token() + "_" + name)).string()) {
     std::filesystem::remove(path_);
   }
   ~TempFile() { std::filesystem::remove(path_); }

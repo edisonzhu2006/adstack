@@ -1,16 +1,22 @@
 # colstore
 
 A columnar analytics store for adstack events, written in C++20 with the
-standard library only. Ingests the `.ads` event files produced by `gen`,
-streamkit's adapters, or any other adstack tool into a `.col` file: row
+standard library only. Ingests two kinds of table into a `.col` file: the
+`.ads` event files produced by `gen` and the real-data adapters (the event
+table, 10 columns) and the per-window aggregate CSV that streamkit writes
+(the aggregate table, 6 columns), so the pipeline `gen -> streamkit ->
+colstore -> query` runs end to end (`bench/e2e.sh`). A `.col` file is row
 groups of 65,536 rows, one chunk per column, an encoding chosen per chunk
-(PLAIN, DICT, DELTA_BP, RLE_DICT), footer with per-chunk metadata including
+(PLAIN, DICT, DELTA_BP, RLE_DICT), and a footer that carries the table's
+schema (column names and integer types) plus per-chunk metadata including
 min/max. Queries run as a vectorized scan (batches of 1024 rows, selection
 vectors, zone-map row-group skipping, dictionary predicates on codes) into
 a hash aggregate (GROUP BY with count / sum / min / max and conditional
 count_if / sum_if, open-addressing table, optionally one thread per set of
 row groups) followed by ORDER BY / LIMIT. Every query can be re-derived
-from the source `.ads` file with one flag. The file format is specified in
+from the source `.ads` file with one flag, and the three benchmark queries
+are compared against SQLite on the same rows in
+[BENCHMARKS.md](BENCHMARKS.md). The file format is specified in
 [FORMAT.md](FORMAT.md); the design decisions are in [NOTES.md](NOTES.md).
 
 ## Build
@@ -21,26 +27,42 @@ From the repository root (cmake and ninja live in
 ```
 cmake -S . -B build-cs -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build-cs
-ctest --test-dir build-cs -R "Footer|RowGroup|Fixture|Codecs|Selector|BitPack|BitWidth|Dictionary|Predicate|ZoneMap|WhereParser|Exec|GroupTable|KeyPacker|Agg|HashAggregate|OrderParser|SortLimit|QueryFiles"
+ctest --test-dir build-cs -R "Footer|Schema|RowGroup|Fixture|Codecs|Selector|BitPack|BitWidth|Dictionary|Predicate|ZoneMap|WhereParser|Exec|GroupTable|KeyPacker|Agg|HashAggregate|OrderParser|SortLimit|QueryFiles|SqliteLoader|CsvRowSource|AggregateTable|AggregateFiles|Widen"
 ```
 
 Targets: `colstore` (CLI), `colstore_core` (static library: format,
-encodings, writer, reader), `colstore_tests`.
+encodings, writer, reader, query engine), `colstore_tests`, and, when CMake
+finds sqlite3 (`find_library`; the macOS SDK has it, Linux needs
+`libsqlite3-dev`), `colstore_sqlite_loader` and `colstore_sqlite` for the
+benchmark comparison. Without sqlite3 those two targets and
+`tests/sqlite_loader_test.cpp` are skipped with a status message and
+everything else builds. `ctest -j N` is safe: every test's temp files
+carry a per-process token (`tests/test_util.h`), because ctest runs each
+gtest case as its own process. The `Agg` pattern above also matches one
+`common/` test (`Agg.CountsByTypeAndSumsCost` from `tests/`), so ctest
+reports 129 entries for the 128 colstore tests.
 
 ## Usage
 
 ```
-# .ads -> .col; the writer picks an encoding per chunk unless told not to
+# .ads -> .col (the event table); the writer picks an encoding per chunk unless told not to
 build-cs/bin/colstore ingest --in events.ads --out events.col [--row-group 65536] [--encoding auto|plain]
 
-# what is in the file: rows, row groups, per-column PLAIN vs stored bytes, encodings used
-build-cs/bin/colstore info --in events.col [--groups]
+# streamkit's CSV -> .col (the aggregate table: window_start_us, campaign_id, impressions,
+# clicks, conversions, cost_micros); the header must be exactly streamkit's, every field an
+# integer that fits its column, or the ingest fails with the line number
+build-cs/bin/colstore ingest --in-csv aggregates.csv --out aggregates.col
+
+# what is in the file: which table, rows, row groups, per-column PLAIN vs stored bytes,
+# encodings used; --groups lists row groups with one column's min..max (--col, default first)
+build-cs/bin/colstore info --in events.col [--groups [--col event_time_us]]
 
 # first n values of one column (decodes whatever encoding each chunk has)
 build-cs/bin/colstore dump --in events.col --col campaign_id --n 20
 
-# prove the round trip: every field of every row equal
+# prove the round trip: every value of every row equal to the original (either input kind)
 build-cs/bin/colstore verify --col events.col --ads events.ads
+build-cs/bin/colstore verify --col aggregates.col --csv aggregates.csv
 
 # query: scan -> filter -> project. --where is "col op const" terms ANDed
 # (ops < <= = >= > and BETWEEN a AND b); --cols picks the output columns
@@ -70,9 +92,18 @@ build-cs/bin/colstore q --in events.col \
 #   --limit N         0 = all rows (default). With no --order the rows come out in first-seen order
 #   --threads T       row groups t, t+T, ... per thread, one hash table each, merged at the end
 #   --stats           groups skipped, rows, groups, table slots and doublings, probes per row, times
+#                     (doublings and probes are summed over every thread's table and the merge)
 #   --check events.ads  recompute the whole GROUP BY from the .ads file (std::map, no shared code
 #                     with the engine) and diff; with --order/--limit also diff the emitted rows
 #                     against a plain std::stable_sort. Exit 1 on any difference.
+#   --check-csv aggregates.csv  the same for an aggregate-table query, reading the CSV back
+
+# the same engine on the aggregate table: column names are the file's own, and every query
+# can be proved against the CSV it was built from
+build-cs/bin/colstore q --in aggregates.col \
+  --where "window_start_us >= 1767225600000000 AND window_start_us < 1767229200000000" \
+  --group campaign_id --agg "sum(cost_micros) AS spend" --order "spend desc" --limit 10 \
+  --check-csv aggregates.csv
 
 # the three benchmark queries (bench/colstore_bench.sh runs them with --check, then times them)
 build-cs/bin/colstore q --in events.col --where "country=840 AND event_type=1" --agg "count()"
@@ -82,8 +113,43 @@ build-cs/bin/colstore q --in events.col --group campaign_id \
   --agg "count_if(event_type=0) AS impressions,count_if(event_type=1) AS clicks,count_if(event_type=2) AS conversions,sum(cost_micros) AS cost_micros"
 ```
 
-Column names: `event_id event_time_us ingest_time_us event_type
-advertiser_id campaign_id video_id country device cost_micros`.
+Column names are the file's (`info` prints them). Event table: `event_id
+event_time_us ingest_time_us event_type advertiser_id campaign_id video_id
+country device cost_micros`. Aggregate table: `window_start_us campaign_id
+impressions clicks conversions cost_micros`. A query or predicate parsed
+for one table is refused on a file of the other (the plan records the
+schema it was parsed against, and the scanner checks each predicate's
+column index, type and name against the file).
+
+The whole pipeline, with every step proved and one report:
+
+```
+bench/e2e.sh build-cs            # gen 5M dirty events -> oracle -> streamkit (4 threads,
+                                 # checkpoints on) -> compare -> ingest both tables -> verify both
+                                 # -> Q1-Q3 --check -> top-10 spend in an hour on the aggregate
+                                 # table, --check-csv and an awk recomputation from the oracle's
+                                 # CSV; exit 1 on any mismatch
+```
+
+SQLite side of the benchmark (`colstore_sqlite`, built when sqlite3 is found):
+
+```
+# .ads -> .sqlite: one rowid table, indexes on (event_time_us), (country, event_type),
+# (campaign_id), ANALYZE; prints load time per phase, sizes per object (dbstat), PRAGMAs, schema
+build-cs/bin/colstore_sqlite load --in events.ads --out events.sqlite [--no-index] [--no-analyze] [--cache-mib 1024]
+
+# one SELECT: rows as CSV on stdout (same shape as `colstore q`), then --runs timed runs
+# on the same connection, each time and the median on stderr; --plan prints EXPLAIN QUERY PLAN,
+# --reopen opens a fresh connection per run
+build-cs/bin/colstore_sqlite query --db events.sqlite --sql "SELECT campaign_id, SUM(cost_micros) AS sum_cost_micros, COUNT(*) AS count FROM events GROUP BY campaign_id" --runs 3 --plan
+
+# bytes per table and index
+build-cs/bin/colstore_sqlite sizes --db events.sqlite
+```
+
+`u64` columns (`event_id`, `video_id`) are stored as the same 64 bits
+reinterpreted as a signed `INTEGER` (SQLite has no unsigned type); see
+`src/sqlite_loader.h`.
 
 ## Reader API
 
@@ -100,8 +166,20 @@ for (size_t g = 0; g < r.num_row_groups(); ++g) {
 
 `read_column<T>` throws if `T` does not have the column's width; it
 decodes any encoding. `read_column_bits` returns 64-bit patterns for
-callers that pick the column at run time. `read_events(g)` rebuilds whole
-`adstack::Event`s and exists for `verify`.
+callers that pick the column at run time. `r.schema()` is the file's
+column list (`Schema`, a vector of name + type); `find_column(schema,
+name)` turns a name into a `ColumnId`, which is the column's index in that
+schema (the named `ColumnId::` members are the event table's indices).
+`read_events(g)` rebuilds whole `adstack::Event`s, exists for the tests,
+and throws on a file that is not the event table. Writing any table:
+
+```cpp
+colstore::ColWriter w("aggregates.col", colstore::aggregate_schema(), 65536, colstore::EncodingPolicy::Auto);
+std::vector<uint64_t> row;                                   // one widened pattern per column
+colstore::CsvRowSource src("aggregates.csv", colstore::aggregate_schema());  // or AdsRowSource
+while (src.next(row)) w.append_row(row);
+w.finish();
+```
 
 ## Query API
 
@@ -109,7 +187,7 @@ callers that pick the column at run time. `read_events(g)` rebuilds whole
 
 ```cpp
 colstore::ColReader r("events.col");
-colstore::Conjunction where = colstore::parse_where("country=840 AND cost_micros > 1000");
+colstore::Conjunction where = colstore::parse_where("country=840 AND cost_micros > 1000", r.schema());
 std::vector<colstore::ColumnId> cols = {colstore::ColumnId::CampaignId, colstore::ColumnId::CostMicros};
 colstore::QueryStats q = colstore::run_query(r, where, cols, [&](const colstore::Batch& b) {
   for (uint32_t k = 0; k < b.selected(); ++k) {           // selection vector: indices of passing rows
@@ -134,9 +212,9 @@ group.
 `src/query.h`, `src/aggregate.h`, `src/sort.h`:
 
 ```cpp
-colstore::QueryPlan plan;
-plan.where = colstore::parse_where("event_type=1");
-plan.group = {colstore::ColumnId::CampaignId};
+colstore::QueryPlan plan;                               // plan.schema defaults to event_schema();
+plan.where = colstore::parse_where("event_type=1");     // parse_where / parse_aggs take a schema
+plan.group = {colstore::ColumnId::CampaignId};          // argument for any other table
 plan.aggs = colstore::parse_aggs("sum(cost_micros) AS cost, count()");
 plan.order = colstore::parse_order("cost desc", colstore::output_columns(plan.group, plan.aggs));
 plan.limit = 20;
@@ -148,6 +226,8 @@ for (uint32_t row : r.rows) {                       // output order
 }
 colstore::write_csv(stdout, r);
 colstore::CheckReport c = colstore::check_against_ads("events.ads", plan, r);  // c.ok, c.detail
+// check_against_csv("aggregates.csv", plan, r) for an aggregate-table plan; both are
+// check_against_rows(RowSource&, ...) underneath
 ```
 
 `HashAggregate` is the operator: `consume(const Batch&)` reads the
@@ -178,11 +258,15 @@ a test checks the result equals trying all four.
 
 ```
 colstore/
-  src/format.h/.cpp    file layout constants, column table, encoding ids, footer encode/decode
+  src/format.h/.cpp    file layout constants, Schema (column list) with the event and aggregate
+                       tables, encoding ids, footer encode/decode (schema + chunk metadata)
   src/bitpack.h        BitWriter / BitReader: n values of w bits in ceil(n*w/8) bytes
   src/encoding.h/.cpp  PLAIN, DICT, DELTA_BP, RLE_DICT codecs; per-chunk selector; min/max
-  src/writer.h/.cpp    ColWriter: buffer a row group, encode + write chunks, write footer
-  src/reader.h/.cpp    ColReader: open, footer, read + decode chunk by (row group, column)
+  src/writer.h/.cpp    ColWriter: buffer a row group per column at natural width (any schema),
+                       encode + write chunks, write footer; append(Event) on top of append_row()
+  src/reader.h/.cpp    ColReader: open, footer + schema, read + decode chunk by (row group, column)
+  src/row_source.h/.cpp RowSource: original rows as widened patterns; AdsRowSource (.ads),
+                       CsvRowSource (streamkit's CSV, strict header and integer parsing)
   src/predicate.h/.cpp Predicate (one [lo, hi] range over an order key), --where parser, zone-map decision
   src/exec.h/.cpp      Scanner (zone maps, per-group decode, 1024-row batches, row-group stride
                        for threads), apply_filter (selection vector), gather (project), run_query, stats
@@ -191,21 +275,38 @@ colstore/
   src/aggregate.h/.cpp KeyPacker (group columns -> GroupKey), --agg parser, HashAggregate
                        (consume / merge / finish), ResultTable
   src/sort.h/.cpp      --order parser, sort_limit (std::sort, or std::partial_sort under LIMIT)
-  src/query.h/.cpp     QueryPlan -> threads -> merge -> sort -> QueryResult; CSV; --check brute force
-  src/main.cpp         CLI: ingest, info, dump, scan, q, verify
+  src/query.h/.cpp     QueryPlan (with its schema) -> threads -> merge -> sort -> QueryResult; CSV;
+                       --check / --check-csv brute force over a RowSource
+  src/main.cpp         CLI: ingest (--in .ads | --in-csv), info, dump, scan, q, verify (--ads | --csv)
+  src/sqlite_loader.h/.cpp  (needs sqlite3) schema from the column table, PRAGMAs as data, bulk load
+                       through the C API, timed queries, EXPLAIN QUERY PLAN, dbstat sizes
+  src/bench_sqlite.cpp (needs sqlite3) colstore_sqlite CLI: load, query, sizes
   tests/               GoogleTest: footer, row-group boundaries, chunk addressing,
                        bit packing, codec round trips, corruption, selector,
                        predicates + parser, zone-map boundaries, scan vs brute force,
                        hash table growth / collisions / vs unordered_map, key packing,
                        aggregates on hand-built batches, merge, ORDER BY / LIMIT vs full sort,
-                       end-to-end queries vs brute force at 1..17 threads, --check failure modes
+                       end-to-end queries vs brute force at 1..17 threads, --check failure modes,
+                       SQLite loader (schema, sums, indexes, u64 round trip, GROUP BY vs map, CSV, plan),
+                       schema footer (both tables, bad schemas), CSV source (streamkit's own writer,
+                       every malformed-row case), aggregate table round trip and queries with
+                       --check-csv, cross-table guards, generic writer == append(Event) byte for byte
   FORMAT.md            byte-level format specification
   NOTES.md             decisions and alternatives
-bench/colstore_bench.sh   gen -> ingest plain x3 -> ingest auto x3 -> verify both -> sizes + info
-                          -> 4 predicates verified vs brute force -> scan times -> zone-map skip
-                          counts vs range width -> batch-size sweep -> codes vs values
-                          -> Q1/Q2/Q3 --check -> Q1/Q2/Q3 times at 1/2/4/8 threads -> sort cost
-                          with and without LIMIT -> batch size with the aggregate -> cold cache
+  BENCHMARKS.md        colstore vs SQLite: machine, commands, settings, tables, plans, write-up
+bench/e2e.sh              [build_dir] [n_events] [work_dir] [threads]
+                          gen -> oracle -> streamkit (checkpoints on) -> compare -> ingest + verify
+                          both tables -> Q1-Q3 --check -> aggregate-table top-10 with --check-csv
+                          and an awk recomputation from the oracle; one report, exit 1 on any mismatch
+bench/colstore_bench.sh   [build_dir] [n_events] [work_dir] [all|m5]
+                          gen (cached in work_dir, default /private/tmp/adstack-cs) -> ingest plain x3
+                          -> ingest auto x3 -> verify both -> sizes + info -> 4 predicates verified vs
+                          brute force -> scan times -> zone-map skip counts vs range width -> batch-size
+                          sweep -> codes vs values -> Q1/Q2/Q3 --check -> Q1/Q2/Q3 times at 1/2/4/8
+                          threads -> sort cost with and without LIMIT -> batch size with the aggregate
+                          -> cold cache -> m5: ingest x3 + SQLite load x3 (medians), sizes, answers
+                          diffed, Q1-Q3 on SQLite (planner's plan and NOT INDEXED) and colstore (1 and
+                          8 threads), Q2 zone-map ratio, markdown tables
 ```
 
 ## Numbers (m2)
@@ -222,7 +323,11 @@ bench/colstore_bench.sh   gen -> ingest plain x3 -> ingest auto x3 -> verify bot
 | ratio vs 520,000,008-byte `.ads` input | 1.0001 | 0.308 (**3.25x smaller**) |
 
 Encoding costs 0.756 s of CPU per 10M rows (76 ns per row, 0.49 ms per
-chunk) and 0.137 s to decode on read. Before the early-exit dictionary
+chunk) and 0.137 s to decode on read. Re-measured on 2026-10-21 from a
+clean rebuild of the same commit: PLAIN 0.480 s, auto 1.257 s (best of 3,
+encoding 0.777 s per 10M rows), verify 0.310 s / 0.469 s, and both output
+files byte-identical to the sizes below, so the per-column table is
+reproducible, not a one-off. Before the early-exit dictionary
 scan, auto ingest of 1M rows took 0.704 s against 0.121 s after (PLAIN
 0.051 s); see NOTES.md.
 
@@ -252,6 +357,10 @@ is the honest number for a timestamp with 5% of values up to 30 s late.
 Same machine, build and 10M-row file; scan times are the engine portion
 from `scan --count --stats` (no row formatting), three runs, all within
 the range shown. Full output: `bench/colstore_bench.sh build-cs 10000000`.
+Re-run on 2026-10-21 from a clean rebuild of the same commit: every count
+in the tables below (rows passed, groups skipped, chunks decoded) came out
+identical and every time within 5% (P3 0.062-0.063 s, P4 0.042-0.044 s,
+row-at-a-time 0.140-0.145 s); details in NOTES.md.
 
 | query (project `campaign_id, cost_micros`) | rows passed | row groups scanned | chunks decoded | time |
 |---|---:|---:|---:|---:|
@@ -327,12 +436,61 @@ the merge is serial: 1.2 ms per merged table, 8 ms at 8 threads, 18 ms at
 16 (where it is 28% of the total). NOTES.md has the breakdown and what
 would fix it.
 
+Re-run on 2026-10-21 from a clean rebuild of the same commit (load average
+4-6 from the other track building on the same machine): all five `--check`
+PASS with every count identical (Q1 269,609 rows; Q2 45 of 153 groups
+skipped, 6,990,857 rows, 100,000 groups in 262,144 slots after 8 doublings,
+1.32 probes per row); medians 0.053 / 0.098 / 0.200 s at one thread and
+0.008 / 0.040 / 0.070 s at eight, i.e. within 13% single-threaded and 3%
+at eight threads; ASan+UBSan and TSan clean on the 10M file; details in
+NOTES.md.
+
 ORDER BY on the 100,000-row Q3 result: full sort 7.1 ms; `LIMIT 20` 0.2 ms;
 `LIMIT 1000` 0.6 ms (`std::partial_sort`, a heap of N). Batch size with
 the aggregate attached (`--vector`): 1024 / 8192 / 65536 rows give
 0.180 / 0.184 / 0.184 s on Q3, a 2% spread, so the m3 guess that 1024
 would clearly win once an operator re-reads the batch did not hold; the
 table's random access dominates, not the batch's cache residency.
+
+All numbers below were re-run on 2026-10-21 after the integration
+(`bench/colstore_bench.sh build-int 10000000 /private/tmp/adstack-cs all`,
+log `/private/tmp/adstack-cs/int_bench_final.txt`): PLAIN ingest best
+0.486 s, auto 1.242 s, sizes 520,074,277 / 160,201,178 bytes (3.25x; 181
+bytes more than before, the schema in the footer), Q1 / Q2 / Q3 medians
+0.051 / 0.095 / 0.180 s at 1 thread and 0.008 / 0.040 / 0.065 s at 8,
+colstore ingest 1.236 s vs SQLite 15.229 s, Q2 42.3x and Q3 27.5x vs
+SQLite's best plan, answers identical, every `--check` PASS.
+
+## Numbers (m5): colstore vs SQLite
+
+Same machine and 10M-row file; SQLite 3.51.0 from the macOS SDK, loaded by
+`colstore_sqlite` with `journal_mode = OFF`, `synchronous = OFF`, a 1 GiB
+cache, indexes on `(event_time_us)`, `(country, event_type)`,
+`(campaign_id)`, then `ANALYZE`; queried with a 1 GiB cache and 1 GiB
+`mmap_size`, three runs on one connection after an untimed first run,
+median. Every query is run on SQLite both as the planner chooses and
+with `NOT INDEXED`; the better one counts. Answers identical on all three
+(CSV diff). Full detail, plans and the write-up: [BENCHMARKS.md](BENCHMARKS.md).
+Command: `bench/colstore_bench.sh build-cs 10000000 /private/tmp/adstack-cs m5`.
+
+| | `.ads` raw | `.col` | `.sqlite` table | `.sqlite` + indexes |
+|---|---:|---:|---:|---:|
+| bytes | 520,000,008 | 160,200,997 (0.31x) | 488,329,216 (0.94x) | 899,682,304 (1.73x) |
+| load, median of 3 | | 1.313 s | 3.066 s insert | + 12.878 s indexes + 0.585 s ANALYZE = 16.529 s |
+
+| query | SQLite planner | SQLite `NOT INDEXED` | colstore 1 thread | colstore 8 threads | 1 thread vs best SQLite |
+|---|---:|---:|---:|---:|---:|
+| Q1 point filter + count | **0.0028 s** | 0.2361 s | 0.055 s | 0.008 s | 0.05x (SQLite 19.6x faster: covering index) |
+| Q2 1 h range, GROUP BY campaign_id | 5.0051 s | **4.0084 s** | 0.094 s | 0.042 s | **42.6x** |
+| Q3 full GROUP BY, 4 aggregates | **5.2669 s** | 7.5260 s | 0.188 s | 0.069 s | **28.0x** |
+
+Q2's zone map skips 45 of 153 row groups (29.4%). colstore wins the two
+GROUP BY queries because it reads three columns instead of reconstructing
+rows, scans encoded data, and skips row groups from the footer; SQLite
+wins the equality count because a covering B-tree index answers it in
+time proportional to the 269,609 matches, and colstore has no secondary
+index (what would fix that is item 1 of "what I would change next" in
+NOTES.md).
 
 ## Status
 
@@ -348,7 +506,8 @@ table's random access dominates, not the batch's cache residency.
       predicates on codes, `--where` parser, `colstore scan`,
       `verify --where` against brute force (4 predicates PASS on 10M rows),
       66 colstore unit tests, ASan+UBSan clean; 60 s time range skips 138
-      of 153 groups and runs in 6 ms
+      of 153 groups and runs in 6 ms; re-verified 2026-10-21 from a clean
+      rebuild (counts identical, times within 5%, ASan and TSan clean)
 - [x] m4: hash aggregate (own open-addressing table, packed 128-bit keys,
       count / sum / min / max / count_if / sum_if), ORDER BY / LIMIT with
       partial sort, `colstore q` with CSV output and `--check` against a
@@ -356,5 +515,29 @@ table's random access dominates, not the batch's cache residency.
       with per-thread tables merged at the end, 105 colstore unit tests,
       ASan+UBSan and TSan clean on the 10M file; Q1 / Q2 / Q3 in
       0.051 / 0.092 / 0.177 s single-threaded, 0.008 / 0.040 / 0.068 s on 8
-      threads, all three `--check` PASS
-- [ ] m5: benchmark vs SQLite; `bench/colstore_bench.sh` extended
+      threads, all three `--check` PASS; re-verified 2026-10-21 from a
+      clean rebuild (counts identical, times within 13% under background
+      load, ASan and TSan clean; fixed a temp-file name collision in the
+      test helper that failed 10 fixture tests under `ctest -j 8`)
+- [x] m5: `colstore_sqlite` (C++ loader over the sqlite3 C API, optional
+      target, schema from the column table, PRAGMAs as data), 9 tests (114
+      colstore tests), `bench/colstore_bench.sh` extended with the SQLite
+      comparison (cached input, `m5` stage), BENCHMARKS.md; on 10M rows:
+      `.col` 0.31x raw vs SQLite 1.73x with indexes, ingest 1.3 s vs 16.5 s,
+      Q2 42.6x and Q3 28.0x faster than SQLite's best plan single-threaded
+      (95x / 76x at 8 threads), Q1 lost 19.6x to the covering index;
+      answers identical across engines; ASan+UBSan and TSan clean
+- [x] integration (2026-10-21): format version 2 carries the schema in the
+      footer; `ingest --in-csv` takes streamkit's aggregate CSV as a
+      6-column table, `verify --csv` and `q --check-csv` prove it, and
+      every component (writer, reader, scanner, predicates, aggregates)
+      works on any integer schema with cross-table mistakes refused by
+      name; `bench/e2e.sh` runs gen -> oracle -> streamkit (4 threads,
+      checkpoints) -> compare -> both ingests + verifies -> Q1-Q3 --check
+      -> top-10 spend in an hour on the aggregate table (--check-csv plus
+      an awk recomputation from the oracle), exit 1 on any mismatch; on 5M
+      events every step PASS, aggregates 3,735,840 rows ingested in 0.46 s
+      (0.13x the CSV bytes), ASan+UBSan and TSan e2e runs clean; event
+      ingest unchanged after the generic writer (PLAIN 0.467 s, auto
+      1.226 s best of 3 on 10M rows, files byte-identical but for the
+      181-byte schema), 128 colstore tests, 207/207 ctest in all trees

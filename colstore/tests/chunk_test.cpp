@@ -81,10 +81,11 @@ TEST_F(Fixture, ChunksTileTheDataRegion) {
   ColReader r(tmp.path());
   uint64_t expect = kHeaderSize;
   for (const auto& rg : r.footer().row_groups) {
-    for (size_t c = 0; c < kNumColumns; ++c) {
+    ASSERT_EQ(rg.chunks.size(), kNumEventColumns);
+    for (size_t c = 0; c < kNumEventColumns; ++c) {
       const ChunkMeta& m = rg.chunks[c];
       EXPECT_EQ(m.offset, expect) << "group/col gap";
-      EXPECT_EQ(m.length, static_cast<uint64_t>(m.rows) * value_width(all_columns()[c].type));
+      EXPECT_EQ(m.length, static_cast<uint64_t>(m.rows) * value_width(event_schema()[c].type));
       expect += m.length;
     }
   }
@@ -142,9 +143,9 @@ TEST_F(AutoFixture, ColumnsLandOnTheExpectedEncoding) {
   EXPECT_EQ(enc(ColumnId::EventType), Encoding::Dict);
   // Encoded chunks are smaller than PLAIN would be, and info's sum works.
   for (const auto& rg : r.footer().row_groups) {
-    for (size_t c = 0; c < kNumColumns; ++c) {
+    for (size_t c = 0; c < kNumEventColumns; ++c) {
       const ChunkMeta& m = rg.chunks[c];
-      EXPECT_LE(m.length, static_cast<uint64_t>(m.rows) * value_width(all_columns()[c].type));
+      EXPECT_LE(m.length, static_cast<uint64_t>(m.rows) * value_width(event_schema()[c].type));
     }
   }
 }

@@ -44,7 +44,6 @@
 // integers with no table lookup. The constant is mapped per row group
 // because every chunk carries its own dictionary.
 
-#include <array>
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -84,7 +83,7 @@ struct Batch {
   size_t row_group = 0;
   uint32_t first_row = 0;  // row index inside the row group
   uint32_t n = 0;          // rows in this batch, <= kVectorSize
-  std::array<ColumnVector, kNumColumns> cols{};
+  std::vector<ColumnVector> cols;  // one per schema column (the Scanner sizes it); unloaded unless needed
   const std::vector<CompiledPredicate>* predicates = nullptr;  // this row group's, for apply_filter
 
   // After apply_filter(): sel holds the indices (0..n-1) of passing rows in
@@ -113,6 +112,8 @@ class Scanner {
  public:
   // `where` is ANDed; `project` lists the columns the consumer will read.
   // Columns in `where` but not in `project` are decoded for filtering only.
+  // Both are checked against the file's schema (reader.schema()): a
+  // predicate built for another table's column throws std::invalid_argument.
   // `batch_rows` exists so the batch-size tradeoff can be measured
   // (`scan --vector N`); 1 is row-at-a-time through the same operators.
   // `first_group` / `group_stride` restrict the scan to row groups
@@ -145,8 +146,8 @@ class Scanner {
 
   const ColReader& reader_;
   Conjunction where_;
-  std::array<bool, kNumColumns> projected_{};
-  std::array<DecodedColumn, kNumColumns> cols_;
+  std::vector<uint8_t> projected_;    // per schema column (uint8_t: vector<bool> has no data())
+  std::vector<DecodedColumn> cols_;   // per schema column
   std::vector<CompiledPredicate> compiled_;  // predicates still needed for the current group
   ScanStats stats_;
 

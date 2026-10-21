@@ -29,6 +29,9 @@ class ColReader {
   ColReader& operator=(const ColReader&) = delete;
 
   const Footer& footer() const { return footer_; }
+  const Schema& schema() const { return footer_.columns; }
+  size_t num_columns() const { return footer_.columns.size(); }
+  bool is_event_table() const { return footer_.columns == event_schema(); }
   size_t num_row_groups() const { return footer_.row_groups.size(); }
   uint64_t total_rows() const { return footer_.total_rows; }
   uint64_t file_size() const { return file_size_; }
@@ -44,10 +47,10 @@ class ColReader {
   template <typename T>
   std::vector<T> read_column(size_t row_group, ColumnId col) const {
     const ChunkMeta& m = chunk(row_group, col);
-    const ColumnType type = column_spec(col).type;
+    const ColumnSpec& spec = spec_of(footer_.columns, col);
+    const ColumnType type = spec.type;
     if (sizeof(T) != value_width(type)) {
-      throw std::runtime_error(std::string("read_column: wrong value type for ") +
-                               column_spec(col).name);
+      throw std::runtime_error("read_column: wrong value type for " + spec.name);
     }
     const std::vector<uint8_t> bytes = read_chunk_bytes(row_group, col);
     // PLAIN is one memcpy straight into the typed vector; everything else
@@ -65,6 +68,7 @@ class ColReader {
 
   // Reassembles whole Events for a row group (all ten columns). Used by
   // `verify`; a real query never does this, that is the point of columnar.
+  // Throws std::logic_error unless is_event_table().
   std::vector<adstack::Event> read_events(size_t row_group) const;
 
  private:

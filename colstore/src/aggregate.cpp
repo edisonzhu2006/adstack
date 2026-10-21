@@ -11,10 +11,10 @@ namespace colstore {
 
 // ---- KeyPacker ----------------------------------------------------------------------
 
-KeyPacker::KeyPacker(std::vector<ColumnId> cols) : cols_(std::move(cols)) {
+KeyPacker::KeyPacker(std::vector<ColumnId> cols, const Schema& schema) : cols_(std::move(cols)) {
   unsigned word = 0, used = 0;  // bits used in the current word
   for (ColumnId c : cols_) {
-    const unsigned bits = static_cast<unsigned>(8 * value_width(column_spec(c).type));
+    const unsigned bits = static_cast<unsigned>(8 * value_width(spec_of(schema, c).type));
     if (used + bits > 64) {  // does not fit in the rest of this word: start the next
       ++word;
       used = 0;
@@ -74,9 +74,9 @@ ColumnType output_type(const AggSpec& a) {
     case AggKind::Count:
     case AggKind::CountIf: return ColumnType::U64;
     case AggKind::Sum:
-    case AggKind::SumIf: return is_signed(column_spec(*a.col).type) ? ColumnType::I64 : ColumnType::U64;
+    case AggKind::SumIf: return is_signed(a.col_type) ? ColumnType::I64 : ColumnType::U64;
     case AggKind::Min:
-    case AggKind::Max: return column_spec(*a.col).type;
+    case AggKind::Max: return a.col_type;
   }
   return ColumnType::U64;
 }
@@ -113,15 +113,15 @@ std::vector<std::string_view> split_top_level(std::string_view text) {
   return out;
 }
 
-ColumnId column_or_throw(std::string_view name, const char* where) {
-  const auto col = column_by_name(trim(name));
+ColumnId column_or_throw(std::string_view name, const char* where, const Schema& schema) {
+  const auto col = find_column(schema, trim(name));
   if (!col) throw std::invalid_argument(std::string("unknown column in ") + where + ": '" + std::string(trim(name)) + "'");
   return *col;
 }
 
 // One --where term, reusing the --where parser; exactly one term allowed.
-Predicate condition_or_throw(std::string_view text) {
-  const Conjunction c = parse_where(text);
+Predicate condition_or_throw(std::string_view text, const Schema& schema) {
+  const Conjunction c = parse_where(text, schema);
   if (c.size() != 1) {
     throw std::invalid_argument("condition must be a single 'column op value' term: '" + std::string(trim(text)) + "'");
   }
@@ -140,9 +140,8 @@ std::string condition_slug(const Predicate& p) {
     case Op::Gt: op = "gt"; break;
     case Op::Between: op = "between"; break;
   }
-  const ColumnType type = column_spec(p.col).type;
-  std::string s = std::string(column_spec(p.col).name) + "_" + op + "_" + format_value(type, p.value_bits);
-  if (p.op == Op::Between) s += "_" + format_value(type, p.hi_bits);
+  std::string s = p.column_name + "_" + op + "_" + format_value(p.type, p.value_bits);
+  if (p.op == Op::Between) s += "_" + format_value(p.type, p.hi_bits);
   for (char& ch : s) if (ch == '-') ch = 'm';  // "cost_micros_lt_m5": no '-' in a name
   return s;
 }
@@ -150,11 +149,11 @@ std::string condition_slug(const Predicate& p) {
 std::string default_name(const AggSpec& a) {
   switch (a.kind) {
     case AggKind::Count: return "count";
-    case AggKind::Sum: return std::string("sum_") + column_spec(*a.col).name;
-    case AggKind::Min: return std::string("min_") + column_spec(*a.col).name;
-    case AggKind::Max: return std::string("max_") + column_spec(*a.col).name;
+    case AggKind::Sum: return "sum_" + a.col_name;
+    case AggKind::Min: return "min_" + a.col_name;
+    case AggKind::Max: return "max_" + a.col_name;
     case AggKind::CountIf: return "count_if_" + condition_slug(*a.cond);
-    case AggKind::SumIf: return std::string("sum_if_") + column_spec(*a.col).name + "_" + condition_slug(*a.cond);
+    case AggKind::SumIf: return "sum_if_" + a.col_name + "_" + condition_slug(*a.cond);
   }
   return "?";
 }
@@ -166,7 +165,14 @@ bool valid_name(std::string_view s) {
   });
 }
 
-AggSpec parse_one(std::string_view piece) {
+// Resolves the aggregated column and copies its type and name into the spec.
+void set_column(AggSpec& a, std::string_view name, const char* func, const Schema& schema) {
+  a.col = column_or_throw(name, func, schema);
+  a.col_type = spec_of(schema, *a.col).type;
+  a.col_name = spec_of(schema, *a.col).name;
+}
+
+AggSpec parse_one(std::string_view piece, const Schema& schema) {
   piece = trim(piece);
   if (piece.empty()) throw std::invalid_argument("empty aggregate in --agg list");
 
@@ -195,16 +201,16 @@ AggSpec parse_one(std::string_view piece) {
     if (!args.empty() && args != "*") throw std::invalid_argument("count() takes no argument (got '" + std::string(args) + "')");
   } else if (func == "sum" || func == "min" || func == "max") {
     a.kind = func == "sum" ? AggKind::Sum : func == "min" ? AggKind::Min : AggKind::Max;
-    a.col = column_or_throw(args, func.c_str());
+    set_column(a, args, func.c_str(), schema);
   } else if (func == "count_if") {
     a.kind = AggKind::CountIf;
-    a.cond = condition_or_throw(args);
+    a.cond = condition_or_throw(args, schema);
   } else if (func == "sum_if") {
     a.kind = AggKind::SumIf;
     const size_t comma = args.find(',');
     if (comma == std::string_view::npos) throw std::invalid_argument("sum_if needs (column, condition): '" + std::string(args) + "'");
-    a.col = column_or_throw(args.substr(0, comma), "sum_if");
-    a.cond = condition_or_throw(args.substr(comma + 1));
+    set_column(a, args.substr(0, comma), "sum_if", schema);
+    a.cond = condition_or_throw(args.substr(comma + 1), schema);
   } else {
     throw std::invalid_argument("unknown aggregate '" + func + "' (count, sum, min, max, count_if, sum_if)");
   }
@@ -214,23 +220,24 @@ AggSpec parse_one(std::string_view piece) {
 
 }  // namespace
 
-std::vector<AggSpec> parse_aggs(std::string_view text) {
+std::vector<AggSpec> parse_aggs(std::string_view text, const Schema& schema) {
   if (trim(text).empty()) throw std::invalid_argument("--agg needs at least one aggregate, e.g. count()");
   std::vector<AggSpec> out;
-  for (std::string_view piece : split_top_level(text)) out.push_back(parse_one(piece));
+  for (std::string_view piece : split_top_level(text)) out.push_back(parse_one(piece, schema));
   return out;
 }
 
 std::string to_string(const AggSpec& a) {
   std::string s = std::string(agg_kind_name(a.kind)) + "(";
-  if (a.col) s += column_spec(*a.col).name;
+  if (a.col) s += a.col_name;
   if (a.cond) s += (a.col ? ", " : "") + to_string(*a.cond);
   return s + ") AS " + a.name;
 }
 
-std::vector<OutputColumn> output_columns(const std::vector<ColumnId>& group, const std::vector<AggSpec>& aggs) {
+std::vector<OutputColumn> output_columns(const std::vector<ColumnId>& group, const std::vector<AggSpec>& aggs,
+                                         const Schema& schema) {
   std::vector<OutputColumn> out;
-  for (ColumnId c : group) out.push_back({column_spec(c).name, column_spec(c).type});
+  for (ColumnId c : group) out.push_back({spec_of(schema, c).name, spec_of(schema, c).type});
   for (const AggSpec& a : aggs) out.push_back({a.name, output_type(a)});
   for (size_t i = 0; i < out.size(); ++i) {
     for (size_t j = 0; j < i; ++j) {
@@ -246,16 +253,26 @@ std::string format_value(ColumnType type, uint64_t bits) {
 
 // ---- HashAggregate -------------------------------------------------------------------
 
-HashAggregate::HashAggregate(std::vector<ColumnId> group, std::vector<AggSpec> aggs)
-    : packer_(std::move(group)), aggs_(std::move(aggs)) {
+HashAggregate::HashAggregate(std::vector<ColumnId> group, std::vector<AggSpec> aggs, const Schema& schema)
+    : schema_(schema), packer_(std::move(group), schema), aggs_(std::move(aggs)) {
   if (aggs_.empty()) throw std::invalid_argument("HashAggregate: at least one aggregate");
   for (const AggSpec& a : aggs_) {
     Column c;
     if (a.col) {
+      // The spec's copied type must be the schema's: a spec parsed for
+      // another table would otherwise sum the wrong column's bytes.
+      if (spec_of(schema_, *a.col).type != a.col_type || spec_of(schema_, *a.col).name != a.col_name) {
+        throw std::invalid_argument("aggregate on '" + a.col_name + "' was built against a different schema");
+      }
       c.col_index = static_cast<size_t>(*a.col);
-      c.type = column_spec(*a.col).type;
+      c.type = a.col_type;
     }
-    if (a.cond) c.cond_index = static_cast<size_t>(a.cond->col);
+    if (a.cond) {
+      if (spec_of(schema_, a.cond->col).type != a.cond->type || spec_of(schema_, a.cond->col).name != a.cond->column_name) {
+        throw std::invalid_argument("condition on '" + a.cond->column_name + "' was built against a different schema");
+      }
+      c.cond_index = static_cast<size_t>(a.cond->col);
+    }
     agg_cols_.push_back(c);
   }
 }
@@ -345,8 +362,8 @@ void HashAggregate::consume(const Batch& b) {
   const uint32_t n = b.selected();
   if (n == 0) return;
   for (ColumnId c : columns_needed()) {
-    if (!b.cols[static_cast<size_t>(c)].loaded()) {
-      throw std::invalid_argument(std::string("HashAggregate: column not loaded in batch: ") + column_spec(c).name);
+    if (column_index(c) >= b.cols.size() || !b.cols[column_index(c)].loaded()) {
+      throw std::invalid_argument("HashAggregate: column not loaded in batch: " + spec_of(schema_, c).name);
     }
   }
   assign_groups(b);
@@ -388,7 +405,7 @@ void HashAggregate::merge(const HashAggregate& other) {
 
 ResultTable HashAggregate::finish() const {
   ResultTable t;
-  t.schema = output_columns(packer_.columns(), aggs_);
+  t.schema = output_columns(packer_.columns(), aggs_, schema_);
   t.cols.assign(t.schema.size(), {});
   const size_t ng = packer_.columns().size();
   const uint32_t groups = table_.size();

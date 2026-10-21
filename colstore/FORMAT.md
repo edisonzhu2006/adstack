@@ -1,10 +1,18 @@
-# .col file format, version 1
+# .col file format, version 2
 
 The on-disk format of colstore. `src/format.h` is the executable version of
 this document; if they disagree, the header wins and this file has a bug.
 
 All integers are little-endian. There is no alignment padding between
 sections; every byte position is recoverable from the footer.
+
+Version 2 (2026-10-21) differs from version 1 in one way: the footer
+carries the table's SCHEMA (column names and physical types), where
+version 1 hardcoded the ten `adstack::Event` fields. A `.col` file is now
+any table of integer columns; the two tables colstore writes are the event
+table and streamkit's aggregate table (both below). Version-1 files are
+refused by the reader (`unsupported .col version 1`) and must be
+re-ingested; nothing persistent depended on them.
 
 ## Overall layout
 
@@ -13,9 +21,9 @@ offset 0        +--------------------------------------+
                 | header: magic "COL1", uint32 version |  8 bytes
                 +--------------------------------------+
                 | row group 0                          |
-                |   chunk: event_id       (DELTA_BP)   |
-                |   chunk: event_time_us  (DELTA_BP)   |
-                |   ... 10 chunks, one per column ...  |
+                |   chunk: column 0       (DELTA_BP)   |
+                |   chunk: column 1       (DELTA_BP)   |
+                |   ... one chunk per schema column ...|
                 +--------------------------------------+
                 | row group 1                          |
                 +--------------------------------------+
@@ -38,38 +46,75 @@ A reader opens the file by:
    the offset and length recorded in the footer.
 
 A file without a valid trailer (writer crashed, disk full) is rejected as a
-whole. There is no partial recovery in v1; the ingest is re-run.
+whole. There is no partial recovery; the ingest is re-run.
 
 ## Header (8 bytes)
 
 | bytes | type   | value                          |
 |-------|--------|--------------------------------|
 | 0..3  | uint32 | `0x314C4F43` (`"COL1"` as LE)  |
-| 4..7  | uint32 | version, currently `1`         |
+| 4..7  | uint32 | version, currently `2`         |
 
 ## Row groups
 
 Rows are split into row groups of at most `rows_per_group` rows (default
 65,536, settable with `colstore ingest --row-group N`). Only the last group
-may be shorter. A row group holds exactly 10 column chunks, in `ColumnId`
-order, back to back. A file with zero rows has zero row groups.
+may be shorter. A row group holds exactly one chunk per schema column, in
+schema order, back to back. A file with zero rows has zero row groups.
 
-## Columns
+## Schema
+
+The footer lists the table's columns: a name and a physical type each.
+Column `i` of the schema is chunk `i` of every row group. Names are
+identifiers (`[A-Za-z_][A-Za-z0-9_]*`, at most 255 bytes, unique within
+the file), because they are what `--where`, `--group` and `--agg` name.
+Physical types are the five integer widths below; there is no other kind
+of column, which is what keeps every codec one implementation.
+
+| type id | name | bytes | signed |
+|---|---|---|---|
+| 0 | u8  | 1 | no  |
+| 1 | u16 | 2 | no  |
+| 2 | u32 | 4 | no  |
+| 3 | u64 | 8 | no  |
+| 4 | i64 | 8 | yes |
+
+A reader learns everything it needs from the footer; the two tables below
+are simply the schemas colstore's own ingest paths write (`event_schema()`
+and `aggregate_schema()` in `src/format.h`), and `colstore info` names a
+file "events", "aggregates" or "custom" by comparing against them.
+
+### The event table (`colstore ingest --in events.ads`)
 
 One column per field of `adstack::Event`, in declaration order.
 
-| id | name             | physical type | notes                             |
-|----|------------------|---------------|-----------------------------------|
-| 0  | `event_id`       | u64           |                                   |
-| 1  | `event_time_us`  | i64           | microseconds since epoch          |
-| 2  | `ingest_time_us` | i64           |                                   |
-| 3  | `event_type`     | u8            | 0 impression, 1 click, 2 conversion |
-| 4  | `advertiser_id`  | u32           |                                   |
-| 5  | `campaign_id`    | u32           |                                   |
-| 6  | `video_id`       | u64           |                                   |
-| 7  | `country`        | u16           | ISO 3166-1 numeric                |
-| 8  | `device`         | u8            | 0 mobile, 1 desktop, 2 TV         |
-| 9  | `cost_micros`    | i64           | may be negative (refunds)         |
+| index | name             | physical type | notes                             |
+|-------|------------------|---------------|-----------------------------------|
+| 0     | `event_id`       | u64           |                                   |
+| 1     | `event_time_us`  | i64           | microseconds since epoch          |
+| 2     | `ingest_time_us` | i64           |                                   |
+| 3     | `event_type`     | u8            | 0 impression, 1 click, 2 conversion |
+| 4     | `advertiser_id`  | u32           |                                   |
+| 5     | `campaign_id`    | u32           |                                   |
+| 6     | `video_id`       | u64           |                                   |
+| 7     | `country`        | u16           | ISO 3166-1 numeric                |
+| 8     | `device`         | u8            | 0 mobile, 1 desktop, 2 TV         |
+| 9     | `cost_micros`    | i64           | may be negative (refunds)         |
+
+### The aggregate table (`colstore ingest --in-csv aggregates.csv`)
+
+One column per field of streamkit's output row (`common/agg.h`:
+`WindowKey` then `Agg`), in the CSV's header order. The CSV header must be
+exactly `window_start_us,campaign_id,impressions,clicks,conversions,cost_micros`.
+
+| index | name              | physical type | notes                              |
+|-------|-------------------|---------------|------------------------------------|
+| 0     | `window_start_us` | i64           | start of the window, microseconds  |
+| 1     | `campaign_id`     | u32           |                                    |
+| 2     | `impressions`     | u64           |                                    |
+| 3     | `clicks`          | u64           |                                    |
+| 4     | `conversions`     | u64           |                                    |
+| 5     | `cost_micros`     | i64           | summed over the window's events    |
 
 ## Column chunk
 
@@ -162,19 +207,25 @@ too. A corrupt chunk therefore throws; it never reads outside the chunk.
 
 ```
 uint32 num_row_groups
-uint32 num_columns          (always 10 in v1; checked on read)
+uint32 num_columns          (1 .. 4096)
 uint32 rows_per_group       (writer setting)
 uint32 reserved             (0)
 uint64 total_rows
+repeat num_columns times (the schema, in chunk order):
+    uint32 type             (type id, table above)
+    uint32 name_len         (1 .. 255)
+    name_len bytes          (the name, no terminator)
 repeat num_row_groups times:
     uint32 rows             (rows in this group)
-    repeat 10 times (ColumnId order):
+    repeat num_columns times (schema order):
         ChunkMeta           (48 bytes, below)
 ```
 
-Footer size = 24 + num_row_groups * (4 + 10 * 48) bytes. For 10M rows at
-65,536 rows per group that is 153 groups and 74,076 bytes, 0.014% of the
-file.
+Footer size = 24 + sum over columns of (8 + name length) + num_row_groups *
+(4 + num_columns * 48) bytes. For the event table (schema 181 bytes) with
+10M rows at 65,536 rows per group that is 153 groups and 74,257 bytes,
+0.014% of the file; for the aggregate table (schema 113 bytes, 292 bytes
+per group) it is smaller still.
 
 ### ChunkMeta (48 bytes)
 
@@ -186,7 +237,7 @@ file.
 | 20..23 | uint32 | `encoding`   | 0 PLAIN, 1 DICT, 2 DELTA_BP, 3 RLE_DICT             |
 | 24..31 | uint64 | `min_bits`   | minimum value, raw 8 bytes                         |
 | 32..39 | uint64 | `max_bits`   | maximum value, raw 8 bytes                         |
-| 40..43 | uint32 | `null_count` | reserved, always 0 (Event has no nullable fields)  |
+| 40..43 | uint32 | `null_count` | reserved, always 0 (no table here has a nullable field) |
 | 44..47 | uint32 | `reserved`   | 0; keeps the record 8-byte aligned                 |
 
 `min_bits` / `max_bits` hold the value's two's-complement bits widened to
@@ -207,13 +258,16 @@ chunk's encoding.
 
 On open, the reader rejects the file if any of these fail: file shorter than
 20 bytes, header magic or version wrong, trailer magic wrong, footer length
-larger than the space between header and trailer, footer length inconsistent
-with `num_row_groups`, `num_columns != 10`, any chunk `rows` differing from
-its group's `rows`, sum of group rows differing from `total_rows`, or any
+larger than the space between header and trailer, `num_columns` zero or
+above 4096, a schema entry truncated, a name that is not an identifier or
+not unique, a type id above 4, footer length inconsistent with
+`num_row_groups` and `num_columns`, any chunk `rows` differing from its
+group's `rows`, sum of group rows differing from `total_rows`, or any
 chunk lying outside `[8, footer_offset)`.
 
 ## Versioning
 
 Any change to the layout above bumps `kColVersion`; readers refuse files
 with a version they do not know. Adding an encoding id does not bump the
-version.
+version. Adding a column to a table does not either: it is a different
+schema in the same format.

@@ -31,14 +31,17 @@ uint64_t max_order_key(ColumnType type) {
   return (uint64_t{1} << (8 * w)) - 1;
 }
 
-Predicate make_predicate(ColumnId col, Op op, uint64_t value_bits, uint64_t hi_bits) {
+Predicate make_predicate(ColumnId col, Op op, uint64_t value_bits, uint64_t hi_bits, const Schema& schema) {
+  const ColumnSpec& spec = spec_of(schema, col);
   Predicate p;
   p.col = col;
+  p.type = spec.type;
+  p.column_name = spec.name;
   p.op = op;
   p.value_bits = value_bits;
   p.hi_bits = op == Op::Between ? hi_bits : 0;
 
-  const ColumnType type = column_spec(col).type;
+  const ColumnType type = spec.type;
   const uint64_t k = order_key(value_bits, type);
   const uint64_t top = max_order_key(type);
   // The "empty" representation is lo = 1, hi = 0. It is needed at the type
@@ -78,6 +81,30 @@ uint64_t event_field_bits(const adstack::Event& e, ColumnId col) {
   throw std::invalid_argument("event_field_bits: bad column id");
 }
 
+void event_row_bits(const adstack::Event& e, uint64_t* out) {
+  // Written out rather than looped over event_field_bits(): this is the
+  // per-row path of every .ads ingest, and ten switch dispatches per row
+  // were measurable (NOTES.md, integration entry).
+  out[0] = widen(e.event_id);
+  out[1] = widen(e.event_time_us);
+  out[2] = widen(e.ingest_time_us);
+  out[3] = widen(e.event_type);
+  out[4] = widen(e.advertiser_id);
+  out[5] = widen(e.campaign_id);
+  out[6] = widen(e.video_id);
+  out[7] = widen(e.country);
+  out[8] = widen(e.device);
+  out[9] = widen(e.cost_micros);
+  static_assert(kNumEventColumns == 10, "update event_row_bits() with the schema");
+}
+
+bool matches_row(const Conjunction& where, const uint64_t* row) {
+  for (const Predicate& p : where) {
+    if (!p.matches(row[column_index(p.col)])) return false;
+  }
+  return true;
+}
+
 bool matches_all(const Conjunction& where, const adstack::Event& e) {
   for (const Predicate& p : where) {
     if (!p.matches(event_field_bits(e, p.col))) return false;
@@ -98,7 +125,7 @@ const char* zone_decision_name(ZoneDecision d) {
 
 ZoneDecision zone_decision(const Predicate& p, uint64_t min_bits, uint64_t max_bits) {
   if (p.empty()) return ZoneDecision::Skip;
-  const ColumnType type = column_spec(p.col).type;
+  const ColumnType type = p.type;
   const uint64_t kmin = order_key(min_bits, type);
   const uint64_t kmax = order_key(max_bits, type);
   // Two intervals on a line: [kmin, kmax] is the chunk, [lo, hi] is the
@@ -208,7 +235,7 @@ uint64_t parse_literal(const std::string& text, const ColumnSpec& spec) {
 
 class Parser {
  public:
-  explicit Parser(std::string_view text) : toks_(tokenize(text)) {}
+  Parser(std::string_view text, const Schema& schema) : toks_(tokenize(text)), schema_(schema) {}
 
   Conjunction parse() {
     Conjunction out;
@@ -235,19 +262,19 @@ class Parser {
   Predicate term() {
     const Token name = take();
     if (name.kind != Tok::Ident) throw std::invalid_argument("where: expected a column name, found '" + name.text + "'");
-    const auto col = column_by_name(name.text);
+    const auto col = find_column(schema_, name.text);
     if (!col) throw std::invalid_argument("where: unknown column '" + name.text + "'");
-    const ColumnSpec& spec = column_spec(*col);
+    const ColumnSpec& spec = spec_of(schema_, *col);
 
     const Token op = take();
     if (op.kind == Tok::Ident && ieq(op.text, "BETWEEN")) {
       const uint64_t lo = parse_literal(number(), spec);
       expect_keyword("AND");
       const uint64_t hi = parse_literal(number(), spec);
-      return make_predicate(*col, Op::Between, lo, hi);
+      return make_predicate(*col, Op::Between, lo, hi, schema_);
     }
     if (op.kind != Tok::Op) throw std::invalid_argument("where: expected an operator after " + name.text + ", found '" + op.text + "'");
-    return make_predicate(*col, op_from_text(op.text), parse_literal(number(), spec));
+    return make_predicate(*col, op_from_text(op.text), parse_literal(number(), spec), 0, schema_);
   }
 
   std::string number() {
@@ -257,6 +284,7 @@ class Parser {
   }
 
   std::vector<Token> toks_;
+  const Schema& schema_;
   size_t pos_ = 0;
 };
 
@@ -266,12 +294,11 @@ std::string format_literal(uint64_t bits, ColumnType type) {
 
 }  // namespace
 
-Conjunction parse_where(std::string_view text) { return Parser(text).parse(); }
+Conjunction parse_where(std::string_view text, const Schema& schema) { return Parser(text, schema).parse(); }
 
 std::string to_string(const Predicate& p) {
-  const ColumnSpec& spec = column_spec(p.col);
-  std::string s = std::string(spec.name) + " " + op_name(p.op) + " " + format_literal(p.value_bits, spec.type);
-  if (p.op == Op::Between) s += " AND " + format_literal(p.hi_bits, spec.type);
+  std::string s = p.column_name + " " + op_name(p.op) + " " + format_literal(p.value_bits, p.type);
+  if (p.op == Op::Between) s += " AND " + format_literal(p.hi_bits, p.type);
   return s;
 }
 

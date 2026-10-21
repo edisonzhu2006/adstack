@@ -58,7 +58,8 @@ ColReader::~ColReader() {
 
 const ChunkMeta& ColReader::chunk(size_t row_group, ColumnId col) const {
   if (row_group >= footer_.row_groups.size()) throw std::out_of_range("row group index");
-  return footer_.row_groups[row_group].chunks[static_cast<size_t>(col)];
+  if (column_index(col) >= footer_.columns.size()) throw std::out_of_range("column index");
+  return footer_.row_groups[row_group].chunks[column_index(col)];
 }
 
 std::vector<uint8_t> ColReader::read_chunk_bytes(size_t row_group, ColumnId col) const {
@@ -78,10 +79,11 @@ Encoding ColReader::checked_encoding(const ChunkMeta& m) {
 std::vector<uint64_t> ColReader::read_column_bits(size_t row_group, ColumnId col) const {
   const ChunkMeta& m = chunk(row_group, col);
   const std::vector<uint8_t> bytes = read_chunk_bytes(row_group, col);
-  return decode_chunk(checked_encoding(m), bytes.data(), bytes.size(), m.rows, column_spec(col).type);
+  return decode_chunk(checked_encoding(m), bytes.data(), bytes.size(), m.rows, spec_of(footer_.columns, col).type);
 }
 
 std::vector<adstack::Event> ColReader::read_events(size_t row_group) const {
+  if (!is_event_table()) throw std::logic_error("read_events: this file is not an event table");
   const auto event_id = read_column<uint64_t>(row_group, ColumnId::EventId);
   const auto event_time_us = read_column<int64_t>(row_group, ColumnId::EventTimeUs);
   const auto ingest_time_us = read_column<int64_t>(row_group, ColumnId::IngestTimeUs);

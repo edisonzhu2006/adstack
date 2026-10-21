@@ -657,3 +657,718 @@ colstore sources (the one warning in the tree is still GoogleTest's own
   not run it. Worth one manual run before the final docs.
 - `--where` still has no OR / NOT / `!=`; none of the three queries needed
   them.
+
+## 2026-10-21: m2 re-verified from a clean build (no code change)
+
+The resumed workflow handed over "colstore m2" as the current milestone,
+but the tree was already committed through m4 (`ada8076`). Rewriting
+working, tested encoders to satisfy a stale task description would have
+been the wrong call, so this session re-ran m2's "done when" from a clean
+rebuild and recorded what, if anything, had drifted. Nothing in
+`colstore/` changed.
+
+**What was re-run.** `ninja -t clean colstore colstore_tests` then rebuild
+in `build-cs` (Release) and `build-cs-asan` (ASan+UBSan); `colstore_tests`
+105/105 in both; `gen --n 10000000 --seed 1`; three timed ingests each of
+`--encoding plain` and auto; `verify` on both files; `info`; ASan ingest +
+verify + dump on the same 10M file and `cmp` against the Release output.
+
+**Numbers today vs 2026-10-19.** PLAIN ingest best of 3: 0.480 s (was
+0.427); auto: 1.257 s (was 1.183). Encoding therefore costs 0.777 s per
+10M rows, 78 ns per row, against 0.756 s two days ago: 3% drift, within
+what a different background load produces, and the ratio (auto 2.6x
+slower than PLAIN) is unchanged. Verify: 0.310 s PLAIN, 0.469 s auto
+(was 0.330 / 0.467). Output sizes are identical byte for byte to the
+earlier run (520,074,096 PLAIN, 160,200,997 auto, 3.25x) and the
+per-column table from `info` matches the README exactly, which is the
+useful finding: the selector is deterministic, so the compression number
+on the resume is reproducible, not a lucky run. ASan ingest 6.73 s, ASan
+verify PASS 2.01 s, ASan output `cmp`-identical to Release.
+
+**The one compiler warning, and why it is left alone rather than
+suppressed from here.** With Apple clang 21 a clean build prints exactly
+one warning: `gtest-printers.h:524`, `-Wcharacter-conversion` (char8_t to
+char32_t), emitted while compiling GoogleTest's own `gtest-all.cc`. It is
+not in a colstore translation unit (zero warnings in `colstore/src` and
+`colstore/tests`); the gtest library target inherits the root
+`add_compile_options` because `FetchContent_MakeAvailable(googletest)`
+runs after the flags are set. Options: (a) `-Wno-character-conversion` on
+the `gtest` target in the root CMakeLists, the right fix, but root CMake
+is not this track's to edit; (b) reach into the `gtest` target from
+`colstore/CMakeLists.txt` with `target_compile_options(gtest ...)`,
+which works mechanically but is exactly the cross-ownership edit the plan
+forbids and would surprise the streamkit track, whose tests link the same
+target; (c) weaken the project flags, ruled out. I also tried re-adding
+gtest's include directory as `SYSTEM` on `colstore_tests`; it had no
+effect, because googletest already exports its headers as SYSTEM and the
+diagnostic is raised in gtest's own compilation unit, not in ours, so the
+change was reverted. Recorded as an open item for the root-CMake pass.
+
+## 2026-10-21: m3 re-verified from a clean build (one comment-level edit)
+
+Same situation as the m2 entry above: the resumed workflow handed over
+"colstore m3" with "m1-m2 done", but the tree is committed through m4
+(`ada8076`), and m3's scanner, filter, zone maps, dictionary-code
+predicates, `--where` parser, `scan` CLI, `verify --where` and tests are
+all in place. Rather than rewrite them to match a stale description, this
+session (1) walked the m3 task list against the code item by item,
+(2) re-ran m3's "done when" from a clean rebuild, and (3) recorded the
+drift. The only source change is a two-line reorder in
+`Scanner::decode_column` (below).
+
+**Item-by-item check against the m3 brief.** Batches of up to 1024 values
+per column with pointers into the decoded row group, not copies: `Batch` /
+`ColumnVector` in `exec.h`. Scan reads only the projected and filtered
+columns of one row group at a time: `Scanner::load_row_group` steps 2 and
+3; `chunks decoded` in `--stats` proves it (43 chunks for 15 groups x 3
+columns, minus 2 dropped predicates). Filter produces a selection vector
+of passing indices, branch-free: `refine()` in `exec.cpp`. Zone-map skip
+before decode, counted and printed: `row_groups_skipped_zone`. Equality
+on a dictionary column maps the constant to a code once per row group:
+`compile_predicate`, two binary searches on the chunk's sorted dictionary.
+CLI `scan --in --where --cols --limit --stats`: `cmd_scan`. Brute-force
+check against the raw `.ads` for the predicates with identical row counts
+and column sums: `cmd_verify_where`, run on four predicates by
+`bench/colstore_bench.sh`. Tests for selection vectors, zone-map boundary
+values and the parser: `exec_test.cpp`, `predicate_test.cpp` (21 tests).
+Nothing on the list is missing, so there was nothing to build.
+
+**The one edit, and why it is not a behavior change.** `decode_column`
+cast `m.encoding` to `Encoding` on one line and range-checked it on the
+next. That order is legal (the enum has a fixed `uint32_t` underlying
+type, so an out-of-range cast is well-defined, and the value was never
+used before the check), but a reader has to know that rule to see the
+code is safe. The check now comes first with a comment saying why. The
+alternative was to leave it, since it was correct; the reorder was chosen
+because "explainable without a language-lawyer argument" is this
+project's bar. Cost: a rebuild of one translation unit. Verified by
+rebuilding all three trees and rerunning the tests (below).
+
+**What was re-run.** `ninja -t clean` then full rebuild of `build-cs`
+(Release) and `build-cs-asan` (ASan+UBSan); `colstore_tests` 105/105 in
+both (ctest reports 106 because gtest discovery adds one entry);
+`gen --n 10000000 --seed 1` (9,899,652 unique, 100,348 dups, 496,040
+late); `bench/colstore_bench.sh build-cs 10000000` end to end; ASan
+`scan --count --stats` on the four bench predicates plus `--vector 1` and
+`--vector 65536`; ASan `verify --where` on three of them; the README's
+`--limit 10` example under ASan; `colstore_tests` under TSan and an
+8-thread `q` on the 10M file under TSan (m3's scanner is what each thread
+runs). Log: `/private/tmp/adstack-cs/bench_rerun_2026-10-21.txt`. Load
+average was 4-5 throughout because the streamkit track was building in
+parallel on the same 18-core machine.
+
+**Numbers today vs 2026-10-19 (10M rows, 153 groups, `--count`).** Every
+count is identical: rows passed 599,888 / 180,421 / 899,878 / 10,284 for
+P1-P4; groups scanned 15 / 15 / 153 / 153; chunks decoded 43 / 58 / 459 /
+306; zone-map skipping for 10 s / 60 s / 300 s ranges 146 / 138 / 101 of
+153 (7 / 15 / 52 scanned). As with m2, the useful finding is that the
+pruning and decode counts are deterministic, so the "138 of 153 skipped"
+headline reproduces exactly. Times: P1 0.006 s (was 0.006), P2 0.008
+(0.008), P3 0.062-0.063 (0.061-0.063), P4 0.042-0.044 (0.041-0.042),
+decode-only two columns 0.036-0.039 (same), three columns 0.056 (0.055).
+Batch sweep on P3: 1 row 0.140-0.145 (was 0.136-0.141), 16 0.069-0.070,
+128 0.063, 1024 0.062-0.063, 8192 0.062, 65536 0.062-0.065; the 2.2x
+row-at-a-time penalty and the saturation by 128 both hold. Dictionary
+codes vs values, `country=840`: auto 0.029-0.030 vs plain 0.023-0.024;
+no-predicate decode 0.024-0.025 vs 0.019-0.020, so the filter still adds
+about 5 ms either way. Largest drift anywhere is 5% (P4), within the
+background-load noise. All four `verify --where` PASS with the same sums
+as on the 19th (e.g. P3 `sum(cost_micros)` 944,501,914,095).
+
+**Sanitizers.** ASan+UBSan: the four scans run clean at 0.037 / 0.037 /
+0.284 / 0.220 s (6-7x the Release time, the usual ASan tax), `verify
+--where` PASS for P2 / P3 / P4 with brute force at 0.48-0.50 s, the
+`--limit 10` example prints 10 rows and stops after 1 group (the stats
+line says so; "rows passed" is then only the batches seen). TSan: 105/105
+tests, and the 8-thread query over P2 reports 138 of 153 groups skipped
+and no race. The one compiler warning is still gtest's own
+`gtest-printers.h:524` and is handled as recorded in the m2 entry.
+
+**What a reviewer should take from this entry.** m3's claims are
+reproducible from one script with no parameter hidden in a shell
+history; the counts are exact and the times move by at most 5% between
+days; and the "unsorted column skips nothing" explanation in the original
+m3 entry (zone maps need the filtered column to be sorted or clustered;
+`campaign_id` is uniform within every group, so every `[min, max]` covers
+the whole domain and 0 of 153 groups are skipped for P4) is still what
+the data shows.
+
+## 2026-10-21: m4 re-verified from a clean build (one test-helper fix, one wording fix)
+
+Same situation as the m2 and m3 entries: the resumed workflow handed over
+"colstore m4" with "m1-m3 done", but the hash aggregate, sort / limit,
+`colstore q`, `--check`, the thread-parallel scan and 39 tests were
+committed on the 19th (`ada8076`). This session walked the m4 brief
+against the code item by item, re-ran the "done when" from a clean rebuild
+of all three trees, and found one real bug, in the test helper, not the
+engine.
+
+**Item-by-item check against the m4 brief.** GROUP BY on one or more
+integer columns with `count() / sum / min / max`: `HashAggregate` in
+`aggregate.h`, keys packed by `KeyPacker`, rejected at plan time past 128
+bits. Own open-addressing table with the probing (linear) and growth
+(power of two, doubling at half load) policy commented: `hash_table.h`,
+first 40 lines. Consumes selection vectors: `consume()` reads rows through
+`Batch::row(k)`. Sort and limit with a partial sort when N is small, and
+why: `sort.h`. CLI `q --in --where --group --agg --order --limit --stats`
+with CSV on stdout: `cmd_q` in `main.cpp`. Q1 / Q2 / Q3 documented with
+their SQL: README "Benchmark queries (m4)". Brute-force verification from
+the `.ads` file: `q --check`, `std::map` and plain signed compares, no
+code shared with the table or the scanner, and `CheckDetectsAWrongResult`
+proves it can fail. Times on 10M, median of 3, cold vs warm noted: the
+bench script, and the cold run is still "not measured" (below).
+Multithreaded scan, row-group-parallel with per-thread tables merged at
+the end, TSan clean: `run_aggregate_query`. Tests for growth and
+collisions (`GroupTable.*`), aggregates on constructed data
+(`HashAggregate.*` on an eight-row batch), ORDER BY / LIMIT
+(`SortLimit.*`, nine LIMITs against the full sort). Nothing on the list
+was missing, so nothing new was built.
+
+**The bug: fixture temp files collided under `ctest -j 8`.** The direct
+`colstore_tests` run passed 105/105 in every tree, but `ctest -j 8`
+failed 10 of 106 on the first try (`AutoFixture.MinMaxStoredForEncodedChunks`,
+`AutoFixture.ReadColumnBitsMatchesTypedRead`, two `ExecFiles.*`, six
+`QueryFiles.*`), all with "unknown file: Failure", and every one of them
+passed under `--rerun-failed`, which runs them one at a time. Cause:
+`TempFile` in `tests/test_util.h` built its path from a fixed name
+(`colstore_test_query.col`) in the shared temp directory. gtest discovery
+makes every test its own ctest entry, and ctest runs them as separate
+PROCESSES; with `-j 8`, two `QueryFiles` fixtures in two processes wrote
+and deleted the same file. The engine was never wrong; a test read a file
+another test had just removed. Why it was not seen on the 19th: every run
+then was the single-process binary or serial ctest. Fix: every temp name
+now carries a per-process token drawn once from `std::random_device`
+(64 bits, so a collision between two concurrent test processes is not a
+realistic event). Alternatives: `getpid()` is the conventional answer and
+would have been one line, but it is POSIX and the project rule is standard
+library only, and the rule is cheaper to keep than to explain an
+exception to; a per-TEST unique name (counter) would not help, because the
+colliding tests are the same test code in different processes. `std::tmpfile`
+cannot be used because the code under test opens files by path. Cost:
+one `std::to_string` per process. Verified: 8 consecutive `ctest -j 8`
+runs per tree (Release, ASan+UBSan, TSan), 24 runs, all 100%, where the
+first parallel run before the fix failed 10. Also recorded, correcting the
+m3 entry's guess: ctest shows 106 entries in the Release and ASan trees
+and 105 in the TSan tree because the README's `-R` pattern contains `Agg`,
+which also matches `Agg.CountsByTypeAndSumsCost` from `tests/` (common),
+and the TSan tree built only the colstore targets. The extra entry is a
+real `common/` test, not a discovery artifact.
+
+**The wording fix.** At 8 threads `--stats` printed "table 262144 slots,
+64 doublings", which reads as a 1,024-slot table that doubled 64 times.
+`AggStats` sums doublings and probes over every thread's table and the
+merge (so that probes per row covers all the work), and `aggregate.h` says
+so, but the printed line did not. It now ends with "(doublings and probes
+summed over all threads' tables and the merge)"; at 16 threads on the
+two-column query the line is 181 characters, inside the 256-byte buffer.
+The alternative was to print thread 0's counts only, which would hide 7/8
+of the probes. Nothing parses that line (the bench script prints it as
+is).
+
+**What was re-run.** `ninja -t clean` then full rebuild of `build-cs`
+(Release, 62 steps) and `build-cs-asan` (ASan+UBSan, 62 steps), and the
+colstore targets in `build-cs-tsan` (33 steps): one warning in each,
+GoogleTest's own `gtest-printers.h:524` (handled as recorded in the m2
+entry), zero in colstore sources, including after the two edits above.
+`colstore_tests` 105/105 direct in all three trees; `ctest -j 8` as
+above. `bench/colstore_bench.sh build-cs 10000000` end to end (log:
+`/private/tmp/adstack-cs/bench_m4_rerun_2026-10-21.txt`). ASan+UBSan on
+the 10M file: `q --check` for Q1, Q2, Q3 at one thread and Q2 / Q3 top-20
+at 8 threads, plus `GROUP BY campaign_id, country` at 4 threads. TSan on
+the 10M file: Q2 and Q3 top-20 at 8 threads with `--check`, and Q3 at 16
+threads. Load average 3.7-5.9 throughout: the streamkit track was
+building and benchmarking on the same machine, as on the m3 re-run.
+
+**Numbers today vs 2026-10-19 (10M rows, 153 groups, `q --stats` total,
+median of 3, page cache warm).** Q1 / Q2 / Q3 at 1 thread 0.053 / 0.098 /
+0.200 s (were 0.051 / 0.092 / 0.177); at 2 threads 0.028 / 0.060 / 0.121
+(0.026 / 0.055 / 0.113); at 4 threads 0.014 / 0.045 / 0.087 (0.014 /
+0.042 / 0.084); at 8 threads 0.008 / 0.040 / 0.070 (0.008 / 0.040 /
+0.068). The final binary (after the wording edit) re-timed at 1 thread
+0.054 / 0.102 / 0.201 and at 8 threads 0.008 / 0.040 / 0.069 with load
+5.9. The largest drift is Q3 at one thread, +13%. It is not an aggregate
+regression: the same run's m2 / m3 numbers moved by the same amount
+(auto ingest best of 3 1.289 s vs 1.183; the full-scan predicate P3
+0.066-0.070 s vs 0.061-0.063; three-column decode-only 0.060-0.061 vs
+0.055-0.056), i.e. everything single-threaded is 8-13% slower under
+today's background load, and the 8-thread numbers, which depend less on
+any one core being free, are within 3%. Every count is identical: Q1
+269,609 rows; Q2 45 of 153 groups skipped, 6,990,857 rows in 6,837
+batches, 100,000 groups in 262,144 slots after 8 doublings, 1.32 probes
+per row; Q3 9,766 batches, same table, same probes. Full sort of the
+100K-row Q3 result 7.4-7.7 ms (was 7.0-7.1), `LIMIT 20` 0.2 ms (same).
+Batch size with the aggregate attached 0.202 / 0.206 / 0.205 s for 1024 /
+8192 / 65536, the same 2% spread, so the "no effect" finding holds. All
+five `--check` runs PASS (brute force 0.337 / 1.878 / 2.497 s for Q1 / Q2
+/ Q3, engine 0.054 / 0.105 / 0.202 s).
+
+**Sanitizers.** ASan+UBSan: Q1 / Q2 / Q3 `--check` PASS at 0.197 / 0.360
+/ 0.895 s engine time (3.7-4.5x Release, the usual tax), Q2 / Q3 top-20
+at 8 threads PASS at 0.138 / 0.240 s, and the two-column query with
+991,852 groups in 2,097,152 slots (run for the table size, no `--check`)
+finished clean at 0.717 s; no reports. TSan: Q2 / Q3 top-20 at 8 threads `--check` PASS at 0.575 /
+1.214 s (the brute force takes 17.7 / 26.7 s under TSan), Q3 at 16 threads
+1.184 s, 105/105 tests, 8 parallel ctest runs; no reports. The cold-cache
+measurement is still not possible from this account (`sudo -n true`:
+"a password is required"), so every number above is warm; the script
+says so in its output.
+
+**Open items noticed but left alone.** `effective_order()` takes a
+`schema` argument it does not use (`(void)schema;`); it is part of the
+signature the CLI and a test call, and removing it is churn with no
+behavior change, so it stays until the m5 pass touches that file.
+`HashAggregate::consume` rebuilds `columns_needed()` (a small vector) per
+batch, 9,766 times on Q3; hoisting it is a micro-optimisation that would
+need measuring to justify and is below the noise measured above.
+
+## 2026-10-21: m5, the SQLite comparison and the write-up
+
+Numbers in this entry: 10M events (`gen --seed 1`), Apple M5 Pro, Release,
+`bench/colstore_bench.sh build-cs 10000000 /private/tmp/adstack-cs m5`
+(log `/private/tmp/adstack-cs/bench_m5_final_2026-10-21.txt`); medians of
+3, page cache warm. The full tables, the machine, the PRAGMAs and the
+plans are in BENCHMARKS.md; this entry is about the decisions.
+
+| | SQLite best plan | colstore 1 thread | colstore 8 threads |
+|---|---:|---:|---:|
+| Q1 point filter + count | **0.0028 s** (covering index) | 0.055 s | 0.008 s |
+| Q2 1 h range GROUP BY | 4.008 s (`NOT INDEXED`) | **0.094 s** (42.6x) | 0.042 s |
+| Q3 full GROUP BY | 5.267 s (index-ordered scan) | **0.188 s** (28.0x) | 0.069 s |
+| bytes | 899,682,304 (1.73x raw, with indexes) | 160,200,997 (0.31x) | |
+| load | 16.5 s (3.1 insert + 12.9 indexes + 0.6 ANALYZE) | 1.3 s | |
+
+Answers identical on all three (CSV diff, 1 / 100,000 / 100,000 rows).
+
+**A C++ loader over the sqlite3 C API instead of the `sqlite3` shell's
+`.import`.** The shell route would be: export the `.ads` rows to CSV,
+`.import` them, type the columns by affinity, and time with `.timer`
+from a script. That is three text conversions of 10M rows and a
+measurement whose settings live in a shell transcript. The C API gives
+the documented fast load (one transaction, one prepared `INSERT` bound
+per row, 3.1 s for 10M rows), the PRAGMAs as code the binary prints, and
+the rows fed from the same `event_field_bits()` view that `verify` and
+`q --check` use, so both engines provably received the same 64-bit
+patterns. A Python loader (the bundled interpreter has sqlite3) would
+have been less code but a second language in a C++ project and a
+10x-slower insert loop that would have muddied the load comparison.
+Cost: the only third-party dependency in colstore. It is fenced: its own
+static library (`colstore_sqlite_loader`) and binary (`colstore_sqlite`),
+found with `find_path`/`find_library`, and when sqlite3 is absent the
+targets and the test file are skipped with a `message(STATUS)` while
+`colstore_core`, the CLI and the other 105 tests build unchanged. The
+`src/*.cpp` glob excludes `sqlite` so the core library cannot pick the
+loader up by accident.
+
+**The schema is generated from colstore's column table.** `CREATE TABLE`
+is built from `all_columns()`, the bind loop iterates the same table, and
+the test checks the statement lists every column in `ColumnId` order. A
+hand-written DDL would silently fall behind a schema change in
+`common/event.h`. All ten columns are `INTEGER NOT NULL`, which lets
+SQLite store each as a 1-9 byte varint; that is its row-level
+compression and it is worth 6% here (488 MB against 520 MB raw).
+
+**u64 stored as the signed reinterpretation.** SQLite integers are signed
+64-bit. `event_id` and `video_id` are `u64`; they go in as
+`static_cast<int64_t>(bits)` and come back exactly through
+`static_cast<uint64_t>`, as `U64AboveInt64MaxRoundTrips...` pins with
+`UINT64_MAX` and `2^63 + 5`. The alternative, 8-byte BLOBs, keeps the
+unsigned order but makes every comparison and index on those columns a
+bytewise memcmp and would have handicapped SQLite for nothing: no
+benchmark query reads either column. Documented in the header rather
+than hidden.
+
+**What "fair to SQLite" meant in practice, and what it cost.** Load with
+`journal_mode = OFF` and `synchronous = OFF` (a fresh bulk load has
+nothing to protect; colstore's writer has no durability either), 1 GiB
+cache, `temp_store = MEMORY`, exclusive locking; indexes created after
+the rows (faster than maintaining them per insert), then `ANALYZE`.
+Query with a 1 GiB cache and `mmap_size` at the 1 GiB maximum this build
+allows, three timed runs on one connection after an untimed first run,
+so SQLite's own page cache is warm; colstore gets no equivalent (each run
+is a fresh process reading through `fread`). Both were checked before
+being fixed: a fresh connection per run and `mmap_size = 0` each moved
+Q2 by less than the run-to-run spread (numbers in BENCHMARKS.md). The
+one rule that mattered: every query runs both as the planner chooses and
+with `NOT INDEXED`, and the better one is the SQLite number. It mattered
+because the planner picked the index range scan for Q2 (5.0 s) when a
+table scan was faster (4.0 s), and the index-ordered scan for Q3
+(5.3 s) when that was the better one (scan 7.5 s). Reporting only the
+planner's choice would have been 53x instead of 42.6x on Q2; reporting
+only `NOT INDEXED` would have been 40x instead of 28x on Q3. Not done:
+a covering index for Q2 or a 64 KiB page size, both of which would help
+SQLite and neither of which the brief named; BENCHMARKS.md says so.
+
+**The cross-engine diff is a second oracle, not a replacement for
+`--check`.** The script writes each query's CSV from both engines, sorts
+and diffs them (colstore aliases nothing; the SQL aliases its output
+columns to colstore's default names so the header lines match too). It
+runs in milliseconds against SQLite's answer, where `--check`'s brute
+force takes seconds, and it catches a class of error `--check` cannot:
+both the engine and the brute force sharing a misreading of the
+predicate semantics (`BETWEEN` inclusive at both ends, `count_if` on
+`event_type`), since SQLite's interpretation of the same SQL is
+independent of any colstore code. Q2 had 0 matching rows on the 1M
+sanitizer file (1M events span 100 s, `T0` is at 300 s) and the diff of
+the two one-line CSVs still passes, which is the right answer, not a
+vacuous one.
+
+**Q1 is lost, and the reason is the design, not a bug.** 2.8 ms against
+55 ms. The `(country, event_type)` index is a covering index for
+`COUNT(*)`: SQLite counts 269,609 B-tree entries at 10 ns each and never
+opens the table. colstore has no secondary index; every row group holds
+country 840, so the zone map skips nothing, and it decodes two columns of
+all 10M rows at 5.5 ns per row. The m4 "Open questions" guessed SQLite
+would win Q2 with a `(campaign_id, event_time_us)` index; it won Q1
+instead, for the more basic reason that an equality filter with a small
+answer is what a B-tree is for. The honest statement for the resume is
+"28x to 43x faster on GROUP BY", not "faster than SQLite". The fix is
+described below (small-domain bitmaps); it was not built because the
+brief for m5 is the comparison, and because a number that was tuned
+after seeing the opponent's result is a different kind of number.
+
+**Why Q2 and Q3 are won by 28x to 43x: three effects that stack.** (1) No
+row reconstruction: SQLite walks each row's record header to extract 3
+of 10 columns (527 ns per row on the index-ordered scan, 753 ns on the
+plain scan); colstore reads three chunk sequences and never sees the
+other seven (18.8 ns per row on Q3, 13.3 ns per scanned row on Q2). (2)
+Encoding-aware scanning: `event_type` is filtered as RLE dictionary
+codes, `campaign_id` and `cost_micros` are delta-coded and decode at
+about a nanosecond a value; Q3's input is 54 MB of chunks against 488 MB
+of records. (3) Zone maps: Q2 drops 45 of 153 groups (2.95M rows) from
+the footer, where SQLite's index plan walks the time index and then does
+7M rowid lookups plus a temp B-tree for the GROUP BY, 716 ns per matched
+row, slower than its own full scan. The hash aggregate with a dense group
+index (m4) is the fourth, smaller, factor against SQLite's sorted temp
+B-tree over 100,000 groups. Storage follows from (2): 16 bytes per row
+against 49 for the table and 90 with the indexes, 5.6x smaller than the
+database the queries ran on. Load follows from having no B-trees to
+build: 1.3 s against 16.5 s, of which 12.9 s is the three `CREATE
+INDEX`.
+
+**Script changes.** The generated `.ads` is now cached in the work
+directory (default `/private/tmp/adstack-cs/`), keyed by N in the file
+name and checked by size (8 + 52 N bytes) before reuse, because `gen` is
+deterministic and the file took the longest to produce; everything else
+the script writes is deleted on exit. A fourth argument selects the
+stage (`all` or `m5`) so the SQLite section, which is three minutes
+mostly spent inside SQLite, can be rerun alone. The median helper and the
+awk ratios are the only arithmetic in the script; the ratio prints two
+decimals below 1 so "SQLite is faster" is still a number (`0.05x`)
+rather than `0.0x`, which the first full run printed.
+
+**Verification.** Release, ASan+UBSan and TSan trees reconfigured and
+rebuilt with the new targets, zero warnings in every tree (the SDK's
+`sqlite3.h` is included as a SYSTEM header; the one warning the project
+has ever shown, GoogleTest's `gtest-printers.h`, did not appear in the
+colstore-only sanitizer builds). 9 new tests (`SqliteLoader.*`, 114
+colstore tests in all): schema from the column table, every row loaded
+with the sums and the minimum (negative) cost matching a brute force,
+three indexes and `sqlite_stat1` present, `--no-index`/`--no-analyze`
+honoured, u64 extremes round-tripping, a Q3-shaped GROUP BY against a
+`std::map`, the CSV shape, the covering-index plan for Q1, `dbstat`
+sizes covering the four objects within the file size, repeat runs and
+error paths (bad SQL throws, a write on the read-only connection
+throws). `ctest -j 8` in Release: 193/193. ASan: 114/114 tests, the
+loader and all three queries on a 1M-row file with the answers diffed
+against colstore's (identical), `verify` on the 10M file (PASS, 2.0 s),
+Q1 / Q2 `--check` at one thread and Q3 top-20 at 8 threads (PASS); no
+reports. TSan: 114/114, Q3 at 8 threads on 10M (1.17 s), the loader on
+1M; no reports. The full script (m1-m5) ran end to end once (exit 0,
+`bench_m5_2026-10-21.txt`, m1-m4 counts identical to the m4 re-run,
+Q1 / Q2 / Q3 0.051 / 0.094 / 0.183 s at one thread), then the m5 stage
+alone for the tables (exit 0). Load average 2.8-4.2 throughout.
+
+**What I would change next, in the order I would do it.**
+
+1. *Small-domain bitmaps for dictionary columns, to stop losing Q1.* For
+   each DICT / RLE_DICT chunk, store one bitmap per dictionary value
+   (10 values for `country`, 3 for `event_type`: 13 bitmaps of 8 KiB per
+   row group, 16.3 MB for 153 groups, a tenth of the file before
+   compressing them; the `event_type` bitmaps are long runs and would
+   shrink to almost nothing). `country = 840 AND event_type = 1` becomes
+   an AND of two 8 KiB bitmaps and a popcount per row group, with no
+   column decoded and no per-row work at all; the same bitmaps drive the
+   selection vector for a subsequent GROUP BY. The cost to measure is
+   the ingest time of building them and the footer growth. This is the column-store answer to an equality
+   filter and it is cheaper than a B-tree because the domain is small.
+   It does nothing for high-cardinality columns (`campaign_id`), which
+   is the right limit: those are the GROUP BY keys, not the filters.
+2. *Hash-partitioned parallel aggregation with a tree merge.* 8 threads
+   give 2.7x on Q3 because every thread builds the full 100K-group table
+   and the merge is serial (m4 measured 1.2 ms per merged table). First
+   the cheap fix, merging pairs in parallel (log T rounds), then the
+   real one: an exchange step that routes each selected row to the
+   thread owning `hash(key) % T`, so each thread holds a disjoint 1/T of
+   the groups, there is no merge and the tables fit in cache. The cost
+   is a partition buffer per thread pair. The ceiling is known: Q1 (one
+   group, nothing to merge) already scales 6.9x on 8 threads (0.055 s to
+   0.008 s), and that is what Q3 would approach instead of 2.7x.
+3. *LZ4 or zstd on top of the encodings, with a measured crossover.*
+   The encodings leave `campaign_id` at 1.7x and `video_id` at 2.9x,
+   and bit-packed deltas still have byte-level structure a general
+   compressor finds. On this machine every query is CPU-bound with the
+   file in the page cache, so block compression would make warm queries
+   slower (a byte-oriented decompressor adds a pass of the same order as
+   the delta decode itself) and cold ones faster, in proportion to the
+   bytes not read from disk. The right design is per-chunk and
+   optional, chosen by the same "try it and keep the smaller" selector,
+   with the cold-cache run that this account cannot do yet (`sudo
+   purge`) as the deciding measurement.
+4. *Statistics-based encoding choice.* Auto ingest takes 1.31 s against
+   0.41 s for PLAIN: two thirds of ingest is encoding every candidate and
+   keeping the smallest. A pass that computes distinct count, max delta
+   width and mean run length (one scan, no output) could pick the
+   encoding without materialising the losers. The target is easy on this
+   file: `info` shows every column ended up with ONE encoding across all
+   153 chunks, so a per-column rule would have been right 1,530 times
+   out of 1,530. The upper bound on the saving is the 0.90 s between
+   auto and PLAIN ingest (1.313 s vs 0.412 s); how much of it a
+   statistics pass keeps is the measurement. The risk is a wrong
+   prediction on data unlike this generator's, so keep the exhaustive
+   mode behind a flag and test that the predictor matches it on the
+   real-data adapters' output.
+5. *Late materialization for selective queries.* The scanner decodes a
+   whole chunk for every column a query touches, then filters. For a
+   predicate that passes 1% of rows and projects five columns that is
+   99% wasted decode on four of them. DELTA_BP's 128-value blocks allow
+   decoding only the blocks that contain selected rows, and DICT chunks
+   can look up single codes; the batch would carry row positions plus
+   lazily decoded columns. Q1-Q3 do not need it (they project what they
+   filter), which is why it was not built; a `scan --cols` with ten
+   columns and a 60 s range would show it.
+6. *A SQL frontend.* Q3 needed a bespoke `count_if(...) AS name` syntax
+   where SQL has `COUNT(*) FILTER (WHERE ...)`. The operators exist
+   (scan, filter, project, hash aggregate, sort, limit); a parser for
+   `SELECT ... FROM events WHERE ... GROUP BY ... ORDER BY ... LIMIT`
+   over them is a few hundred lines and would let the benchmark feed
+   the same text to both engines, removing the hand translation in the
+   script as a source of error. OR and NOT in the WHERE clause would
+   come with it; today a disjunction has to be two queries.
+
+Also worth doing, smaller: sort each row group by `event_time_us` at
+ingest so the zone map stops paying the constant 5 extra groups per time
+range (m3), at the cost of scrambling the arrival-order columns that
+compress best today, which makes it a measurement rather than an
+obvious win; and the two leftovers from the m4 re-verify
+(`effective_order()`'s unused parameter, `columns_needed()` rebuilt per
+batch), still untouched because neither changes a number.
+
+## 2026-10-21: integration, the schema in the footer and the CSV boundary
+
+**Problem.** The plan's integration step: `colstore ingest` takes
+streamkit's aggregate CSV as a second input kind, so `gen -> streamkit ->
+colstore -> query` runs end to end, with `bench/e2e.sh` proving every
+stage in one report. The m1 format hardcoded the ten `adstack::Event`
+columns: `kNumColumns = 10`, `std::array<ChunkMeta, 10>` in every row
+group, a global `column_spec(ColumnId)` table that the writer, reader,
+scanner, predicate parser, key packer and aggregate parser all consulted.
+A six-column table of `(window_start_us, campaign_id, impressions,
+clicks, conversions, cost_micros)` does not fit that, so the question was
+how to generalize without rewriting the engine or slowing the event path.
+
+### Decision 1: the schema is data in the file, format version 2
+
+The footer now starts with the column list (per column: `uint32 type`,
+`uint32 name_len`, the name), before the row-group records, and
+`kColVersion` is 2. A `Schema` is a `std::vector<ColumnSpec{name, type}>`;
+a `ColumnId` is the column's INDEX in the schema (the named `ColumnId::`
+members are the event table's indices, kept so the existing code and 100+
+test call sites still read as before). Every component that used to call
+`column_spec(id)` now gets the schema from the one place that owns it: the
+writer from its constructor, the reader from the footer, the scanner from
+the reader, and the two parsers from an argument (defaulting to the event
+schema, which is what nine of ten callers mean).
+
+Alternatives:
+
+- *Keep version 1 and add a second hardcoded table* (`kNumColumns` becomes
+  a per-table constant, `std::variant` of two column enums). Smallest
+  diff, but every third table is another fork, the reader cannot open a
+  file without being told which table it is, and "what columns does this
+  file have" stays a compile-time fact about the binary rather than a
+  fact about the file. Parquet, ORC and Arrow all carry the schema; the
+  reason is exactly that a reader must be able to open a file it was not
+  compiled for.
+- *A schema file next to the .col file* (sidecar). Two files to keep
+  together; a copy of one without the other is unreadable. The footer
+  already exists and is already variable-length, so 8 bytes plus the name
+  per column is the cheapest possible place: 181 bytes for the event
+  table, 113 for the aggregate table, against a 74 KB footer for 10M
+  rows.
+- *Infer the schema from the CSV header* rather than requiring streamkit's
+  exact header. Rejected for now: the types cannot be inferred from
+  decimal text (is `campaign_id` u32 or u64?), and a wrong guess would
+  silently change what `--where campaign_id < 0` means. The CSV reader
+  takes the schema it must match (`aggregate_schema()`), and the header
+  string is the check that the file is streamkit's. A `--schema` flag
+  naming the types would make the CSV path general; nothing needs it yet.
+
+What it costs: one version bump (version-1 files are refused with a clear
+message; none were persistent, the benches regenerate them in seconds);
+`RowGroupMeta::chunks` and `Batch::cols` are `std::vector`s instead of
+`std::array`s (sized once per scanner, not per batch, so the hot loops
+see no difference: Q1-Q3 at 1 thread are 0.050 / 0.094 / 0.180 s against
+0.051 / 0.092 / 0.177 s before); and 181 extra footer bytes per file.
+
+### Decision 2: a predicate and an aggregate spec carry their column's type and name
+
+`Predicate` gained `type` and `column_name`, `AggSpec` gained `col_type`
+and `col_name`, copied from the schema they were parsed against. Two
+reasons. `Predicate::matches()` runs per row inside `count_if` / `sum_if`
+and must not look a type up; before, it called the global table, which
+no longer exists. And the copies are what make cross-table mistakes
+detectable: the scanner checks each predicate's index, type and name
+against the file's schema, `HashAggregate` does the same for every spec,
+and `run_aggregate_query` compares the whole `plan.schema` with the file.
+So a `--where campaign_id = 7` parsed for the event table (index 5, u32)
+run on an aggregate file (where index 5 is `cost_micros`, i64) is an error
+naming the column, not a comparison of the wrong bytes. The alternative,
+threading a `const Schema&` into every `matches()` call, would have put
+a pointer dereference per row in the two conditional-aggregate loops and
+still not caught the mismatch.
+
+Cost: `Predicate` and `AggSpec` hold a `std::string`, so they are no
+longer trivially copyable. Neither is copied on a hot path (a
+`CompiledPredicate`, which is, holds only integers).
+
+### Decision 3: the writer buffers bytes at natural width, any schema, one code path
+
+`ColWriter` replaced its ten typed `std::vector`s with one
+`ColumnBuffer{type, width, bytes, used}` per schema column: a byte array
+sized once for a full row group, filled at the column's own width. A
+row arrives as `const uint64_t*` (one widened pattern per column, the
+same representation the predicates and the brute-force checks use), and
+`append(Event)` is `event_row_bits()` plus `append_row()`. The point of
+natural width is that the buffer IS the PLAIN chunk: flushing PLAIN is a
+`write()` of the buffer, no narrowing pass, and the typed `min/max` for
+the zone map runs on the buffer as it stands (`min_max_bytes`, one
+`std::minmax_element` at the right width). The 64-bit view that the
+codecs need is built only under `--encoding auto`.
+
+The first version of this cost real time, which the harness caught:
+`vector::insert` of a 1 to 8 byte range per value, a widen pass for
+PLAIN chunks that never used it, a branchy 64-bit min/max, and ten switch
+dispatches per row in `event_field_bits()` took the 10M-row PLAIN ingest
+from 0.47 s to 0.83 s and auto from 1.26 s to 1.59 s. Fixed in the same
+session by pre-sizing the buffers and writing with a fixed-size `memcpy`
+per width, computing min/max typed from the bytes, widening only under
+auto, and writing `event_row_bits()` out field by field: PLAIN 0.467 s
+(best of 3; 0.412 to 0.480 s across earlier sessions) and auto 1.226 s
+(1.183 to 1.313 s before). The files are byte-identical to the typed
+writer's apart from the 181-byte schema in the footer (520,074,277 vs
+520,074,096 PLAIN; 160,201,178 vs 160,200,997 auto), and a test writes
+1,000 events through `append(Event)` and through `append_row()` and
+compares the two files byte for byte.
+
+Alternative kept in mind: a `std::variant` of typed vectors per column.
+It keeps everything typed but needs a visitor at every append, which is
+the switch I just removed, and it is a page of template code a student
+would have to explain. The byte buffer is three lines.
+
+### Decision 4: one RowSource for "the original rows", so every proof covers both tables
+
+`verify`, `verify --where`, `q --check` and ingest all walk the original
+rows once. `RowSource` (`next(std::vector<uint64_t>&)` in some schema) has
+two implementations, `AdsRowSource` over `EventReader` and `CsvRowSource`
+over the CSV, and the four consumers are written once against it. That is
+why the aggregate table got `verify --csv` and `q --check-csv` for free,
+and why `bench/e2e.sh` can prove the aggregate query the same way it
+proves Q1-Q3. The CSV reader is strict on purpose (exact header, exactly
+six decimal integers per line, each fitting its type, line number in
+every error): it exists to prove a pipeline, and a tolerant parser would
+turn a corrupted row into a plausible number.
+
+### Decision 5: the boundary between the two engines stays streamkit's CSV
+
+Why not a binary record or an Arrow stream, and what either would buy,
+is written up in `streamkit/NOTES.md` (same date) from the producer's
+side. From colstore's side the measurement is: 3,735,840 aggregate rows
+(127 MB of text, 7.7x the 16.6 MB `.col`) parse at 7.2M rows/s, 0.52 s,
+of which the `from_chars` calls are roughly half; a 36-byte binary record
+would cut that to a `memcpy` per row but save almost no bytes (134 MB:
+decimal integers are short), and an Arrow IPC stream would additionally
+let colstore take columns without a transpose and ingest as windows
+close. None of that matters while the stages run one after another on
+one machine and the oracle, `compare.sh` and the e2e's awk step all read
+text; the first live-ingest requirement or the first column added on one
+side only would change the answer.
+
+### What `bench/e2e.sh` proves, and how
+
+Default 5M events at `gen --rate 1000` (83 one-minute windows, so the
+"chosen hour" [2026-01-01T00:00, 01:00) selects 60 of them and the zone
+map on `window_start_us` skips 13 of the 58 aggregate row groups; at the
+generator's default rate the whole file would fit in one hour and every
+row would pass). Steps: gen, oracle, streamkit at 4 threads with
+checkpoints every 1M events (5 epochs committed), `compare.sh`, ingest
+and verify both tables, Q1-Q3 with `--check`, the top-10-by-spend query
+with `--check-csv`, and the same top 10 recomputed by awk from the
+oracle's CSV (sorted by spend desc, campaign asc, the engine's tiebreak).
+Every step records PASS/FAIL and the script exits 1 if any failed, which
+a one-off run with a wrapper `oracle` that added 1 to one row's cost
+confirmed (`compare` FAIL, the awk check FAIL, `E2E FAIL`, exit 1).
+
+### Verification (all from this session, build trees `build-int*`, Apple M5 Pro, load 3 to 7)
+
+- `cmake --build build-int --clean-first`: 1 warning in the whole tree, in
+  GoogleTest's own `gtest-all.cc` (the known `-Wcharacter-conversion` one
+  from the m2 entry), 0 in any project translation unit; the ASan+UBSan
+  and TSan trees rebuilt with 0 warnings.
+- `ctest -j 8`: 207/207 in Release, ASan+UBSan and TSan (128 colstore
+  tests, 14 of them new: schema footer for both tables and bad schemas,
+  `CsvRowSource` on `write_csv_row`'s own output and every malformed-row
+  case, aggregate-table round trip, writer guards, generic-vs-typed
+  writer byte equality, the e2e query with `--check-csv` on an in-test
+  CSV, cross-table guards at every layer, scan on the aggregate table).
+- `bench/e2e.sh build-int` (5M events, 4 threads): E2E PASS, exit 0.
+  Report (wall seconds around each process):
+
+  | step | result | s |
+  |---|---|---:|
+  | gen | 5,000,000 events, 49,791 dups, 246,957 late | 0.38 |
+  | oracle | 3,735,840 windows | 1.67 |
+  | streamkit | same counts, 0 late-dropped, 5 checkpoint epochs, 7.6M events/s | 0.82 |
+  | compare.sh | 3,735,840 windows identical | 10.4 |
+  | ingest events.ads | 260,000,008 -> 80,386,496 bytes (0.31x), 77 groups | 0.78 |
+  | verify events | all 10 columns of 5,000,000 rows identical | 0.27 |
+  | ingest aggregates.csv | 127,086,825 -> 16,587,534 bytes (0.13x), 58 groups | 0.47 |
+  | verify aggregates | all 6 columns of 3,735,840 rows identical | 0.35 |
+  | Q1 / Q2 / Q3 (--check) | engine 0.007 / 0.026 / 0.045 s; 1 / 100,000 / 100,000 groups identical | 0.17 / 0.82 / 1.14 |
+  | Q4 top-10 spend in the hour (--check-csv) | engine 0.019 s; 13 of 58 groups skipped; 100,000 groups and 10 ordered rows identical | 0.53 |
+  | awk from the oracle's CSV | top 10 identical (20307 first, spend 15,931,296) | 2.49 |
+
+  The same script at 1M events: ASan+UBSan tree E2E PASS, TSan tree E2E
+  PASS, 0 sanitizer reports in either. With a wrapper `oracle` that adds 1
+  to one row's cost (a one-off, not kept): `compare` FAIL, `E2E FAIL`,
+  exit 1.
+- `bench/colstore_bench.sh build-int 10000000 /private/tmp/adstack-cs all`
+  on the final binary (`/private/tmp/adstack-cs/int_bench_final.txt`):
+  PLAIN ingest best 0.486 s, auto 1.242 s (medians in the m5 table 1.236
+  s vs SQLite 15.229 s); sizes 520,074,277 / 160,201,178 bytes (3.25x);
+  all four `verify --where` and all five `q --check` PASS with the counts
+  of the 19th; Q1 / Q2 / Q3 medians 0.051 / 0.095 / 0.180 s at 1 thread
+  and 0.008 / 0.040 / 0.065 s at 8; SQLite comparison 42.3x (Q2) and
+  27.5x (Q3) single-threaded, Q1 0.05x, answers identical.
+
+### What I would change next
+
+1. *`--schema` for the CSV path.* `CsvRowSource` takes a `Schema`; the CLI
+   only ever passes `aggregate_schema()`. A `--schema "name:type,..."`
+   flag is twenty lines and makes any integer CSV a `.col` file.
+2. *Ingest from a pipe.* Both sources accept `-`, so `streamkit --out - |
+   colstore ingest --in-csv - --out agg.col` works today; the e2e does not
+   use it because the CSV must also feed `compare.sh`. A `tee` would do.
+3. *The aggregate table's own encodings.* `window_start_us` lands on
+   RLE_DICT at 6,248x in the 200K smoke run (a handful of distinct windows
+   in long runs) and `cost_micros` on DELTA_BP at 2.8x; nothing was tuned
+   for it, and the per-chunk selector just worked. Worth a table in
+   BENCHMARKS.md once the aggregate queries are part of the benchmark.
+4. *Dedup-aware comparison of the two tables.* Q2 on the event table and
+   Q4 on the aggregate table answer the same question except that the raw
+   events still contain the 1% duplicates streamkit removed; an e2e step
+   that computes both and diffs them after a `--where`-free dedup would
+   tie the two engines' answers together directly instead of each to its
+   own brute force.
+5. *The 10 s `compare.sh`* is now the slowest step of a pipeline whose
+   engines take 0.8 s each; it sorts 3.7M rows twice through `sort(1)`.
+   The oracle could write in sorted order and a `cmp` would do.

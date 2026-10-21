@@ -237,6 +237,12 @@ class Worker {
 struct PipelineResult {
   uint64_t events = 0;           // records the reader handed out in this run
   uint64_t reader_stalls = 0;    // times the reader found a queue full (backpressure)
+  // read(2) calls that returned data. On a file that is about one per MiB;
+  // on a pipe it is how often the producer's bytes arrived, which is the
+  // granularity of the --latency-stats arrival stamps (m5), so the summary
+  // prints it next to the percentiles. Counted always; it is one increment
+  // per block.
+  uint64_t input_reads = 0;
   double read_secs = 0;          // reader start to last worker joined
   double total_secs = 0;         // including concatenation of the parts
   std::vector<WorkerStats> workers;

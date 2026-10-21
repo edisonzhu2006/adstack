@@ -214,6 +214,13 @@ void merge_atomic(const std::vector<std::string>& parts, const std::string& fina
   if (::rename(tmp.c_str(), final_path.c_str()) != 0) {
     throw std::runtime_error(std::string("rename output: ") + std::strerror(errno));
   }
+  // Same rule as every rename in checkpoint.cpp: the new name is only
+  // durable once the directory is fsync'ed. Without this a power loss right
+  // after run_pipeline deleted the checkpoint directory could forget the
+  // rename but keep the deletion, leaving neither an output nor a
+  // checkpoint to resume from. (SIGKILL cannot do that; only power loss can.)
+  const fs::path parent = fs::path(final_path).parent_path();
+  durable_sync_dir(parent.empty() ? fs::path(".") : parent);
 }
 
 // Part files sit next to the output. "-" (stdout) has no "next to", so they
@@ -561,6 +568,7 @@ class Reader {
     const auto t0 = std::chrono::steady_clock::now();
     uint64_t handed_at_start = handed_;
     while ((n = in.next_block(records, short_read)) > 0) {
+      ++result.input_reads;
       // --latency-stats: this is the instant the block's bytes entered the
       // process; every batch started from this block carries it.
       if (cfg_.latency_stats) block_arrival_ns_ = now_ns();

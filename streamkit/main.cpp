@@ -58,7 +58,7 @@ void usage() {
     "  --throttle-eps   cap the reader at N events/s (for crash tests; 0 = unlimited)\n"
     "  --no-fsync       skip fsync in the checkpoint path (for measuring its cost only; a\n"
     "                   checkpoint then survives SIGKILL but not power loss)\n"
-    "  --latency-stats  print p50/p99/max emit latency at exit: per window closed by the\n"
+    "  --latency-stats  print min/p50/p99/max emit latency at exit: per window closed by the\n"
     "                   watermark, wall time from the closing event's block being read to\n"
     "                   the row being appended (zero cost when off)\n");
 }
@@ -214,10 +214,16 @@ int main(int argc, char** argv) {
     if (lat.count == 0) {
       std::fprintf(stderr, "streamkit: emit latency: no windows were closed by the watermark\n");
     } else {
+      // input reads says how finely the arrival stamps were taken: on a pipe
+      // fed by gen --pace it is the producer's write granularity.
+      const uint64_t reads = r.input_reads > 0 ? r.input_reads : 1;
       std::fprintf(stderr,
-                   "streamkit: emit latency over %zu watermark-closed windows: p50 %u us, p99 %u us, "
-                   "max %u us (block read -> row appended; excludes lateness)\n",
-                   lat.count, lat.p50_us, lat.p99_us, lat.max_us);
+                   "streamkit: emit latency over %zu watermark-closed windows: min %u us, p50 %u us, "
+                   "p99 %u us, max %u us (block read -> row appended; excludes lateness); "
+                   "input reads %llu (mean %llu events/read)\n",
+                   lat.count, lat.min_us, lat.p50_us, lat.p99_us, lat.max_us,
+                   static_cast<unsigned long long>(r.input_reads),
+                   static_cast<unsigned long long>(total.events / reads));
     }
   }
   return 0;

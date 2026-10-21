@@ -17,10 +17,13 @@ namespace {
 // stay unloaded, which is how the Scanner hands out columns a query did
 // not ask for.
 struct FakeBatch {
-  std::array<std::vector<uint64_t>, kNumColumns> store;
+  std::array<std::vector<uint64_t>, kNumEventColumns> store;
   Batch b;
 
-  explicit FakeBatch(uint32_t n) { b.n = n; }
+  explicit FakeBatch(uint32_t n) {
+    b.n = n;
+    b.cols.resize(kNumEventColumns);  // what the Scanner does for the file's schema
+  }
   void set(ColumnId c, std::vector<uint64_t> values) {
     EXPECT_EQ(values.size(), b.n);
     auto& v = store[static_cast<size_t>(c)];
