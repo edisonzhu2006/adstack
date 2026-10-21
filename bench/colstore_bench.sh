@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# colstore benchmark harness. Every colstore number in docs/BENCHMARKS.md and
-# colstore/README.md comes from this script.
+# colstore benchmark harness. Every colstore number in colstore/BENCHMARKS.md
+# and colstore/README.md comes from this script.
 #
-#   bench/colstore_bench.sh [build_dir] [n_events] [work_dir]
+#   bench/colstore_bench.sh [build_dir] [n_events] [work_dir] [stage]
+#
+#   build_dir  default build;  n_events default 10000000;
+#   work_dir   default /private/tmp/adstack-cs: the generated .ads file is
+#              CACHED there (gen is deterministic for seed 1, and 10M events
+#              take a few seconds to write), everything else is deleted on exit;
+#   stage      all (default) or m5: only the SQLite comparison.
 #
 # m1: generate n events, ingest to .col, verify every field against the
 # source, print ingest time (best of 3, input in page cache) and file sizes.
@@ -20,17 +26,28 @@
 # at 1 / 2 / 4 / 8 threads; sort cost of ORDER BY with and without LIMIT;
 # batch size with the aggregate attached; a cold-cache run when `sudo -n
 # purge` is available (it is not without a password, and then it says so).
-# m5 appends the SQLite comparison.
+# m5: the same rows loaded into SQLite by build/bin/colstore_sqlite (one
+# rowid table, indexes on (event_time_us), (country, event_type),
+# (campaign_id), ANALYZE; PRAGMAs printed), load time (3 runs, median) for
+# both engines, storage sizes, Q1-Q3 on both (3 runs, median; SQLite with
+# the planner's plan and with NOT INDEXED, the better one counts), the
+# answers diffed, the zone-map skip ratio for Q2, and markdown tables.
+# Skipped with a message when colstore_sqlite was not built (no sqlite3).
 set -euo pipefail
 B=${1:-build}
 N=${2:-10000000}
-W=${3:-$(mktemp -d)}
+W=${3:-/private/tmp/adstack-cs}
+STAGE=${4:-all}
 mkdir -p "$W"
-ADS="$W/bench_events.ads"
+ADS="$W/bench_events_${N}.ads"
 COL_PLAIN="$W/bench_events_plain.col"
 COL="$W/bench_events.col"
-cleanup() { rm -f "$ADS" "$COL_PLAIN" "$COL"; }
+SQL="$W/bench_events.sqlite"
+OUT="$W/bench_answers"
+mkdir -p "$OUT"
+cleanup() { rm -f "$COL_PLAIN" "$COL" "$SQL" "$OUT"/*.csv; rmdir "$OUT" 2>/dev/null || true; }
 trap cleanup EXIT
+size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1"; }
 
 echo "== machine"
 echo "cpu:   $(sysctl -n machdep.cpu.brand_string 2>/dev/null || grep -m1 'model name' /proc/cpuinfo | cut -d: -f2)"
@@ -38,8 +55,16 @@ echo "cores: $(sysctl -n hw.ncpu 2>/dev/null || nproc)"
 echo "os:    $(uname -sr)"
 echo "build: $B"
 
-echo "== generate $N events (seed 1)"
-"$B/bin/gen" --n "$N" --seed 1 --out "$ADS"
+# 8-byte header + 52 bytes per event (common/event.h); a file of the wrong
+# size is a different N or a torn write, and is regenerated.
+if [ -f "$ADS" ] && [ "$(size "$ADS")" -eq $((8 + 52 * N)) ]; then
+  echo "== reuse cached $ADS ($N events, seed 1)"
+else
+  echo "== generate $N events (seed 1) -> $ADS"
+  "$B/bin/gen" --n "$N" --seed 1 --out "$ADS"
+fi
+
+if [ "$STAGE" != "m5" ]; then
 
 echo "== ingest --encoding plain (3 runs; take the best)"
 for i in 1 2 3; do
@@ -56,7 +81,6 @@ echo "== verify every field (plain, then auto)"
 "$B/bin/colstore" verify --col "$COL" --ads "$ADS"
 
 echo "== sizes"
-size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1"; }
 ads_bytes=$(size "$ADS")
 plain_bytes=$(size "$COL_PLAIN")
 col_bytes=$(size "$COL")
@@ -194,3 +218,144 @@ else
   echo "not measured: evicting the page cache needs 'sudo purge' and no password-less sudo is available;"
   echo "all times above are with the .col file in the page cache (it was written moments earlier)."
 fi
+
+fi  # STAGE != m5
+
+# ---- m5: SQLite comparison ---------------------------------------------------
+# Same rows, same three queries. SQLite is a row store with B-tree indexes;
+# colstore is a column store with zone maps. Each query runs on SQLite twice:
+# as the planner chooses (with the indexes and ANALYZE statistics) and with
+# `NOT INDEXED` (a plain table scan), and the faster of the two is the SQLite
+# number in the table, because the point is the storage model, not a planner
+# decision. colstore is shown at 1 thread (SQLite is single-threaded, so this
+# is the like-for-like row) and at 8.
+echo "== m5 SQLite comparison"
+if [ ! -x "$B/bin/colstore_sqlite" ]; then
+  echo "skipped: $B/bin/colstore_sqlite was not built (cmake did not find sqlite3)"
+  exit 0
+fi
+T0=${T0:-1767225900000000}
+Q1W="country=840 AND event_type=1";                      Q1A="count()"
+Q2W="event_time_us BETWEEN $T0 AND $((T0 + 3600000000))"; Q2G=campaign_id; Q2A="sum(cost_micros),count()"
+Q3G=campaign_id
+Q3A="count_if(event_type=0) AS impressions,count_if(event_type=1) AS clicks,count_if(event_type=2) AS conversions,sum(cost_micros) AS cost_micros"
+# Output column names are aliased to colstore's defaults so the CSVs diff.
+S1="SELECT COUNT(*) AS count FROM events WHERE country = 840 AND event_type = 1"
+S2="SELECT campaign_id, SUM(cost_micros) AS sum_cost_micros, COUNT(*) AS count FROM events WHERE event_time_us BETWEEN $T0 AND $((T0 + 3600000000)) GROUP BY campaign_id"
+S3="SELECT campaign_id, COUNT(*) FILTER (WHERE event_type = 0) AS impressions, COUNT(*) FILTER (WHERE event_type = 1) AS clicks, COUNT(*) FILTER (WHERE event_type = 2) AS conversions, SUM(cost_micros) AS cost_micros FROM events GROUP BY campaign_id"
+
+# median of three space-separated numbers
+med3() { echo "$1" | tr ' ' '\n' | grep . | sort -g | sed -n 2p; }
+
+echo "-- colstore ingest (auto), 3 runs"
+cs_ingest=""
+for i in 1 2 3; do
+  t=$("$B/bin/colstore" ingest --in "$ADS" --out "$COL" 2>&1 | sed -n 's/.*rows in \([0-9.]*\) s.*/\1/p')
+  cs_ingest="$cs_ingest $t"
+done
+cs_ingest_med=$(med3 "$cs_ingest")
+echo "   seconds:$cs_ingest | median $cs_ingest_med"
+
+echo "-- sqlite load (table, 3 indexes, ANALYZE), 3 runs; settings printed once"
+sq_insert=""; sq_index=""; sq_analyze=""; sq_total=""
+for i in 1 2 3; do
+  log=$("$B/bin/colstore_sqlite" load --in "$ADS" --out "$SQL" 2>&1)
+  [ "$i" = 1 ] && echo "$log" | sed 's/^/   /'
+  line=$(echo "$log" | grep '^sqlite load:')
+  sq_insert="$sq_insert $(echo "$line" | sed 's/.*insert \([0-9.]*\) s.*/\1/')"
+  sq_index="$sq_index $(echo "$line" | sed 's/.*indexes \([0-9.]*\) s.*/\1/')"
+  sq_analyze="$sq_analyze $(echo "$line" | sed 's/.*analyze \([0-9.]*\) s.*/\1/')"
+  sq_total="$sq_total $(echo "$line" | sed 's/.*total \([0-9.]*\) s.*/\1/')"
+done
+sq_version=$(echo "$log" | sed -n 's/.*sqlite \([0-9.]*\)$/\1/p')
+echo "   insert:$sq_insert | median $(med3 "$sq_insert")"
+echo "   indexes:$sq_index | median $(med3 "$sq_index")"
+echo "   analyze:$sq_analyze | median $(med3 "$sq_analyze")"
+echo "   total:$sq_total | median $(med3 "$sq_total")"
+sq_table_bytes=$(echo "$log" | sed -n 's/.*table only \([0-9]*\) bytes.*/\1/p')
+sq_bytes=$(size "$SQL")
+ads_bytes=$(size "$ADS")
+col_bytes=$(size "$COL")
+
+echo "-- answers: colstore q (1 thread) vs sqlite, CSVs sorted and diffed"
+"$B/bin/colstore" q --in "$COL" --where "$Q1W" --agg "$Q1A" > "$OUT/cs_q1.csv"
+"$B/bin/colstore" q --in "$COL" --where "$Q2W" --group "$Q2G" --agg "$Q2A" > "$OUT/cs_q2.csv"
+"$B/bin/colstore" q --in "$COL" --group "$Q3G" --agg "$Q3A" > "$OUT/cs_q3.csv"
+"$B/bin/colstore_sqlite" query --db "$SQL" --sql "$S1" --runs 1 > "$OUT/sq_q1.csv" 2>/dev/null
+"$B/bin/colstore_sqlite" query --db "$SQL" --sql "$S2" --runs 1 > "$OUT/sq_q2.csv" 2>/dev/null
+"$B/bin/colstore_sqlite" query --db "$SQL" --sql "$S3" --runs 1 > "$OUT/sq_q3.csv" 2>/dev/null
+answers_ok=yes
+for q in 1 2 3; do
+  if diff <(LC_ALL=C sort "$OUT/cs_q$q.csv") <(LC_ALL=C sort "$OUT/sq_q$q.csv") > /dev/null; then
+    echo "   Q$q: identical ($(($(wc -l < "$OUT/cs_q$q.csv") - 1)) rows)"
+  else
+    echo "   Q$q: DIFFER"; answers_ok=no
+  fi
+done
+
+# SQLite: median of 3 same-connection runs after one untimed run; prints the plan.
+sq_time() {  # $1 = sql; echoes "median" and prints plan + runs to stdout as a side line
+  local log
+  log=$("$B/bin/colstore_sqlite" query --db "$SQL" --sql "$1" --runs 3 --plan 2>&1 >/dev/null)
+  echo "$log" | grep -E 'plan:|sqlite query' | sed 's/^ *//; s/^/      /' >&2
+  echo "$log" | sed -n 's/.*| median \([0-9.]*\) s.*/\1/p'
+}
+# colstore: median of 3 `q --stats` totals (scan + aggregate + sort, no CSV).
+cs_time() {
+  local out=""
+  for i in 1 2 3; do
+    out="$out $("$B/bin/colstore" q --in "$COL" --stats "$@" 2>&1 >/dev/null | grep '^output:' | sed 's/.*total //; s/ s$//')"
+  done
+  echo "      colstore runs:$out" >&2
+  med3 "$out"
+}
+better() { awk -v a="$1" -v b="$2" 'BEGIN{print (a < b) ? a : b}'; }
+# a/b; two decimals below 1 so "SQLite faster" is still a number, n/a when b is 0.000 (tiny inputs)
+ratio() { awk -v a="$1" -v b="$2" 'BEGIN{ if (b <= 0) printf "n/a"; else if (a / b < 1) printf "%.2f", a / b; else printf "%.1f", a / b }'; }
+
+echo "-- query times (3 runs each, median; page cache warm)"
+echo "   Q1 sqlite (planner):";    sq1=$(sq_time "$S1")
+echo "   Q1 sqlite (NOT INDEXED):"; sq1n=$(sq_time "${S1/FROM events/FROM events NOT INDEXED}")
+echo "   Q1 colstore 1 thread:";    cs1=$(cs_time --where "$Q1W" --agg "$Q1A" --threads 1)
+echo "   Q1 colstore 8 threads:";   cs1p=$(cs_time --where "$Q1W" --agg "$Q1A" --threads 8)
+echo "   Q2 sqlite (planner):";    sq2=$(sq_time "$S2")
+echo "   Q2 sqlite (NOT INDEXED):"; sq2n=$(sq_time "${S2/FROM events/FROM events NOT INDEXED}")
+echo "   Q2 colstore 1 thread:";    cs2=$(cs_time --where "$Q2W" --group "$Q2G" --agg "$Q2A" --threads 1)
+echo "   Q2 colstore 8 threads:";   cs2p=$(cs_time --where "$Q2W" --group "$Q2G" --agg "$Q2A" --threads 8)
+echo "   Q3 sqlite (planner):";    sq3=$(sq_time "$S3")
+echo "   Q3 sqlite (NOT INDEXED):"; sq3n=$(sq_time "${S3/FROM events/FROM events NOT INDEXED}")
+echo "   Q3 colstore 1 thread:";    cs3=$(cs_time --group "$Q3G" --agg "$Q3A" --threads 1)
+echo "   Q3 colstore 8 threads:";   cs3p=$(cs_time --group "$Q3G" --agg "$Q3A" --threads 8)
+
+zone=$("$B/bin/colstore" q --in "$COL" --where "$Q2W" --group "$Q2G" --agg "$Q2A" --stats 2>&1 >/dev/null | grep 'row groups:')
+zone_total=$(echo "$zone" | sed 's/.*row groups: \([0-9]*\) total.*/\1/')
+zone_skipped=$(echo "$zone" | sed 's/.*total, \([0-9]*\) skipped by zone map.*/\1/')
+rows1=$(($(wc -l < "$OUT/cs_q1.csv") - 1)); rows2=$(($(wc -l < "$OUT/cs_q2.csv") - 1)); rows3=$(($(wc -l < "$OUT/cs_q3.csv") - 1))
+
+echo
+echo "== m5 results (markdown)"
+echo "SQLite $sq_version; $N events; answers identical: $answers_ok"
+echo
+echo "| storage | bytes | vs .ads |"
+echo "|---|---:|---:|"
+echo "| .ads (raw 52-byte rows) | $ads_bytes | 1.00x |"
+echo "| .col (colstore, auto encodings) | $col_bytes | $(awk -v a="$ads_bytes" -v b="$col_bytes" 'BEGIN{printf "%.2fx", b/a}') |"
+echo "| .sqlite table only | $sq_table_bytes | $(awk -v a="$ads_bytes" -v b="$sq_table_bytes" 'BEGIN{printf "%.2fx", b/a}') |"
+echo "| .sqlite with 3 indexes + ANALYZE | $sq_bytes | $(awk -v a="$ads_bytes" -v b="$sq_bytes" 'BEGIN{printf "%.2fx", b/a}') |"
+echo
+echo "| load (median of 3) | seconds |"
+echo "|---|---:|"
+echo "| colstore ingest (encode per chunk, write .col) | $cs_ingest_med |"
+echo "| SQLite INSERT (one transaction, prepared statement) | $(med3 "$sq_insert") |"
+echo "| SQLite 3 x CREATE INDEX | $(med3 "$sq_index") |"
+echo "| SQLite ANALYZE | $(med3 "$sq_analyze") |"
+echo "| SQLite total | $(med3 "$sq_total") |"
+echo
+echo "| query | rows out | SQLite planner | SQLite NOT INDEXED | colstore 1 thread | colstore 8 threads | colstore 1 thread vs best SQLite |"
+echo "|---|---:|---:|---:|---:|---:|---:|"
+echo "| Q1 point filter + count | $rows1 | $sq1 s | $sq1n s | $cs1 s | $cs1p s | $(ratio "$(better "$sq1" "$sq1n")" "$cs1")x |"
+echo "| Q2 1h range, GROUP BY campaign_id | $rows2 | $sq2 s | $sq2n s | $cs2 s | $cs2p s | $(ratio "$(better "$sq2" "$sq2n")" "$cs2")x |"
+echo "| Q3 full GROUP BY, 4 aggregates | $rows3 | $sq3 s | $sq3n s | $cs3 s | $cs3p s | $(ratio "$(better "$sq3" "$sq3n")" "$cs3")x |"
+echo
+echo "Q2 zone map: $zone_skipped of $zone_total row groups skipped ($(awk -v a="$zone_skipped" -v b="$zone_total" 'BEGIN{printf "%.1f", 100*a/b}')%)"
+[ "$answers_ok" = yes ]
