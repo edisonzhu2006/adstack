@@ -19,7 +19,9 @@ from the last commit with byte-identical output, which `bench/crash.sh`
 proves by SIGKILLing the process at random points and diffing the final
 result against the oracle.
 
-Design decisions and measurements are in [NOTES.md](NOTES.md).
+Design decisions are in [NOTES.md](NOTES.md); every measured number, with
+the machine, load, and command that produced it, is in
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ## Usage
 
@@ -28,6 +30,7 @@ streamkit --in FILE --out FILE [--window-s 60] [--slide-s WINDOW] [--lateness-s 
           [--late-out FILE] [--threads P] [--queue-depth 4096] [--batch 128]
           [--dedup-bucket-s 1] [--no-dedup] [--reader-decode]
           [--ckpt-dir DIR] [--checkpoint-every-events 1000000] [--resume] [--throttle-eps N]
+          [--no-fsync] [--latency-stats]
 ```
 
 | flag | meaning |
@@ -48,6 +51,8 @@ streamkit --in FILE --out FILE [--window-s 60] [--slide-s WINDOW] [--lateness-s 
 | `--checkpoint-every-events` | input events between checkpoint markers (default 1,000,000) |
 | `--resume` | continue from `--ckpt-dir`'s `MANIFEST` if there is one, otherwise start from byte 0; without this flag a checkpoint directory that holds state is an error |
 | `--throttle-eps` | cap the reader at N events/s so a run lasts long enough to be killed mid-flight (crash tests; 0 = unlimited) |
+| `--no-fsync` | skip every fsync in the checkpoint path, to measure what durability costs; a checkpoint then survives SIGKILL but not power loss |
+| `--latency-stats` | print min/p50/p99/max emit latency at exit: per window closed by the watermark, wall time from `read(2)` returning the input block that holds the closing event to the row being appended (`latency.h`, NOTES.md m5 for the exact definition), plus how many `read(2)` calls the input arrived in; zero cost when off |
 
 The stderr summary has three lines (four with `--ckpt-dir`): totals
 (events, dups, late, windows, wall time, events/s, threads); the scaling
@@ -80,10 +85,30 @@ bench/compare.sh truth.csv results.csv
 ```
 
 `bench/smoke.sh build-sk [n] [seed]` runs the oracle comparison at 1, 2, 4
-and 8 threads. `bench/throughput.sh build-sk [extra streamkit flags]` prints
-the throughput table (10M events, median of three runs per thread count).
-`bench/crash.sh build-sk [trials] [throttle_eps] [n_events]` is the
-SIGKILL-and-resume harness (default 50 trials on a 2M-event stream).
+and 8 threads. `bench/crash.sh build-sk [trials] [throttle_eps] [n_events]`
+is the SIGKILL-and-resume harness (default 50 trials on a 2M-event stream).
+
+`bench/throughput.sh build-sk [--only sections] [extra streamkit flags]` is
+the benchmark harness; it prints markdown with the machine, build, load
+average and exact command above every table, three runs per cell with the
+median in bold:
+
+```
+bench/throughput.sh build-sk                          # all five sections, about 3.5 minutes
+bench/throughput.sh build-sk --only threads,latency   # a subset
+bench/throughput.sh build-sk --reader-decode          # extra flags go to every streamkit run
+```
+
+| section | what it measures |
+|---|---|
+| `threads` | events/s at 1, 2, 4, 8 threads on a 10M-event dirty stream |
+| `dedup` | dedup on vs `--no-dedup` on a dirty and a clean stream, 1 and 8 threads |
+| `checkpoint` | no checkpoints vs every 1M vs every 100K events, 8 threads, with the snapshot cost |
+| `memory` | max RSS (`/usr/bin/time -l`) at 1M and 10M events, 1 and 8 threads, and 8 threads with `--queue-depth 256` |
+| `latency` | `gen --pace` at 200K events/s for 20 s piped into `--window-s 1 --lateness-s 2 --latency-stats`, 1 and 8 threads, min/p50/p99/max per run and the median over runs |
+
+The inputs (1.1 GB) are generated once by seed and cached in
+`/private/tmp/adstack-sk`.
 
 ## How it works
 
@@ -149,15 +174,18 @@ checkpoint.h / .cpp durable writes (fsync, F_FULLFSYNC, tmp + rename), snapshot 
                     resume preparation, epoch coordinator
 spsc_queue.h        bounded single-producer single-consumer ring (claim/publish, front/pop)
 dedup.h / .cpp      time-bucketed exact dedup set, with export/import for snapshots
+latency.h           --latency-stats: the metric's definition and the percentile arithmetic
 tests/              GoogleTest unit tests (globbed by CMakeLists.txt)
 CMakeLists.txt      streamkit_core library + streamkit binary + streamkit_tests
 NOTES.md            decision log, one entry per milestone
+BENCHMARKS.md       every measured number, with machine, load, command and the run-to-run spread
 ```
 
 ## Status
 
 - [x] m1: single-threaded tumbling windows, watermark, late side output; matches the oracle on duplicate-free streams
 - [x] m2: bounded exact dedup; matches the oracle with 1% duplicates (seeds 1..5 at 1M events), RSS 61.6 MiB at 1M events vs 71.0 MiB at 10M, 5.19M events/s single-threaded vs 5.94M without dedup
-- [x] m3: reader thread + hash-partitioned workers over SPSC queues, per-worker watermark and part files, sliding windows (`--slide-s`, oracle too); matches the oracle at 1/2/4/8 threads, tumbling and sliding; 10M events: 5.20M events/s at 1 thread, 9.41M at 2, 19.9M at 4, 30.9M at 8 (5.94x); ASan and TSan clean
-- [x] m4: marker-based checkpoints (per-worker atomic snapshots, MANIFEST rename as commit, F_FULLFSYNC on Apple) and `--resume` with truncate-and-replay output; `bench/crash.sh`: 50/50 SIGKILL-and-resume trials identical to the oracle (139 kills, 46 trials killed 2+ times); checkpoint cost: ~2.3 MB and ~35 ms per worker per checkpoint at 8 threads (28 ms of it fsync), 9.1 MB at 98K open windows; ASan and TSan clean on resume runs
-- [ ] m5: benchmark table (events/s vs P, p50/p99 emit latency under `--pace`, memory, dedup overhead) via `bench/throughput.sh`
+- [x] m3: reader thread + hash-partitioned workers over SPSC queues, per-worker watermark and part files, sliding windows (`--slide-s`, oracle too); matches the oracle at 1/2/4/8 threads, tumbling and sliding; 10M events: 5.20M events/s at 1 thread, 9.41M at 2, 19.9M at 4, 30.9M at 8 (5.94x); ASan and TSan clean. Re-verified 2026-10-21 on the finished tree (m4 and the m5 plumbing included): 78/78 tests, smoke PASS at 1/2/4/8 threads tumbling and sliding, ASan and TSan clean on 1M-event runs, 0 warnings; 27.1M events/s at 8 threads (5.38x) on a loaded machine, see NOTES.md for the evidence
+- [x] m4: marker-based checkpoints (per-worker atomic snapshots, MANIFEST rename as commit, F_FULLFSYNC on Apple) and `--resume` with truncate-and-replay output; `bench/crash.sh`: 50/50 SIGKILL-and-resume trials identical to the oracle on 2026-10-19 (139 kills, 46 trials killed 2+ times) and twice again on 2026-10-21 on the finished tree (148 kills / 46 trials killed 2+ times, then 136 kills / 43 on the final binary); checkpoint cost: 9.07 MB and 28 to 30 ms per snapshot at 98K open windows (13 to 15 ms of it fsync), ~4.2 MB and 21 to 24 ms per worker per checkpoint at 4 threads; ASan and TSan clean on kill-and-resume runs; the output file's rename is now followed by a directory fsync like every checkpoint rename (NOTES.md, 2026-10-21 m4 entry)
+- [x] integration (2026-10-21): the output CSV is colstore's second input kind (`colstore ingest --in-csv`); `bench/e2e.sh` runs gen -> oracle -> streamkit (4 threads, checkpoints on) -> compare -> colstore on both tables with every answer brute-force checked, exit 1 on any mismatch; NOTES.md says why the boundary is CSV and what a binary or Arrow-style one would buy
+- [x] m5: `bench/throughput.sh` with five sections (threads, dedup, checkpoint, memory, latency) and `BENCHMARKS.md`, all from 2026-10-21 on a loaded machine (load average 3.5 to 4.5): 4.4 to 5.1M events/s at 1 thread and 26.3 to 27.3M at 8 (5.4x to 5.9x; the idle-machine table from the 19th is 5.20M / 9.41M / 19.9M / 30.9M); dedup 51 ns per event (25.6% at 1 thread, 10 to 16% at 8), same on clean and dirty streams; checkpoints every 1M events cost 32 ms per snapshot and nothing else (-47% at benchmark speed, 0.03% at the generator's native rate); max RSS 92.5 MiB at 1M events vs 102.4 MiB at 10M at 1 thread, 87 vs 137 MiB at 8 threads with `--queue-depth 256` (the default queues add up to 27 MB per worker once touched); emit latency under `gen --pace` at 200K events/s, 1 s windows, 2 s lateness: p50 6.7 ms / p99 12.9 ms at 8 threads, 13.4 / 23.3 ms at 1 thread, decomposed in BENCHMARKS.md (a 1.3 to 3 ms floor from the producer's 1 MiB bursts, then rows written one after another at 0.24 us each with one worker and 1.0 us each with eight, a contention in the row path that is the first "what I would change"); final regression on the same tree: smoke PASS at 1/2/4/8, crash harness 50/50 (125 kills), 79/79 tests and 0 warnings in Release, ASan+UBSan and TSan

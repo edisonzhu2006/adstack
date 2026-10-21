@@ -805,3 +805,610 @@ Reading the table:
   one does not checkpoint every 36 ms.
 - **Resume on a pipe** via an upstream replayable log; the manifest already
   stores an offset, so only the reader's "seek" changes.
+
+## 2026-10-21: m3 re-verified on the finished tree
+
+**Why this entry exists.** The m3 entry above was written on 2026-10-19
+while m3 was the newest code. Since then m4 (checkpoints) landed in the
+same reader and worker, and the m5 emit-latency plumbing (`latency.h`,
+`--latency-stats`) was wired in. This session re-ran every m3 "done when"
+check on the tree as it stands, so the m3 claims are known to hold for the
+code that will actually ship, not just the code that existed when they
+were first made. No design changed; the diff of this session is one file
+mode and the docs.
+
+### One defect found and fixed
+
+`bench/throughput.sh` was created on the 19th without the execute bit
+(`-rw-r--r--`), so `bench/throughput.sh build-sk` failed with "permission
+denied"; the m3 table must have been produced by invoking it through
+`bash`. Fixed with `chmod +x`, which is how the other four harnesses are
+stored. The README's command line now works as written.
+
+### What was re-run, and the result
+
+- **Warnings.** `touch` every source this track owns, then
+  `cmake --build build-sk --target streamkit streamkit_tests adstack_tests
+  oracle gen evdump`: 16 translation units recompiled, 0 warnings under
+  `-Wall -Wextra -Wpedantic -Wshadow -Wconversion`. The fresh ASan and TSan
+  trees (17 TUs each, googletest included) each show exactly one warning,
+  and it is in googletest's own `gtest-all.cc` (`gtest-printers.h:524`,
+  `-Wcharacter-conversion`, a clang 21 diagnostic). Our test TUs include
+  gtest through `-isystem` and are clean; silencing the library's own
+  compile belongs in the root CMake `FetchContent`, which this track does
+  not own.
+- **Unit tests.** `ctest --test-dir build-sk -R '^(Window|Agg|Sliding|...
+  |Latency)\.'` (this track's suites only; colstore's are the other track's):
+  78/78 (16 in `adstack_tests`, 62 in `streamkit_tests`).
+- **Oracle match, `bench/smoke.sh build-sk 200000 7`:** PASS at 1, 2, 4
+  and 8 threads, tumbling (92,609 windows identical) and sliding 300s/60s
+  (436,985 windows identical); 1,951 dups in every run, equal to the
+  oracle's.
+- **ASan+UBSan (`build-sk-asan`):** 16/16 and 62/62 tests; 1M events
+  (`gen --seed 1`) at `--threads 4`, tumbling: 205,806 windows identical to
+  the oracle, sliding 300s/60s: 605,807 identical; stderr holds the three
+  summary lines and nothing else (`grep -c 'Sanitizer|runtime error'` = 0).
+- **TSan (`build-sk-tsan`):** 62/62 tests; 1M events at `--threads 4`
+  identical to the oracle, 0 reports; and the maximum-handoff-rate
+  configuration, 1M events sliding at `--threads 8 --batch 4
+  --queue-depth 4`, identical to the oracle, 0 reports (3.29 s under TSan:
+  250K batches through eight queues, which is the hardest case for the
+  release/acquire pairing in `spsc_queue.h`).
+
+### Throughput today, and why it is lower than on the 19th
+
+`bench/throughput.sh build-sk`, same machine (Apple M5 Pro, 18 hardware
+threads, 24 GB), same input (`gen --n 10000000 --seed 1`), same command
+(`--lateness-s 60`), three runs per P, median:
+
+| run | threads | run 1 | run 2 | run 3 | median events/s | speedup | reader stalls | worker idle waits |
+|---|---|---|---|---|---|---|---|---|
+| 00:44 EDT | 1 | 5,057,341 | 5,032,221 | 5,029,794 | **5,032,221** | 1.00x | 71,612 | 1 |
+| | 2 | 8,970,398 | 8,740,039 | 9,338,358 | **8,970,398** | 1.78x | 32,392 | 2 |
+| | 4 | 18,686,740 | 18,528,303 | 18,391,435 | **18,528,303** | 3.68x | 11,916 | 4 |
+| | 8 | 27,098,227 | 27,124,952 | 27,033,898 | **27,098,227** | 5.38x | 1,891 | 161 |
+| 00:48 EDT | 1 | 4,640,864 | 4,959,435 | 4,975,646 | **4,959,435** | 1.00x | 71,641 | 1 |
+| | 2 | 9,317,083 | 9,452,555 | 9,133,616 | **9,317,083** | 1.88x | 32,144 | 2 |
+| | 4 | 18,042,246 | 17,557,405 | 17,092,314 | **17,557,405** | 3.54x | 11,499 | 4 |
+| | 8 | 21,588,898 | 23,669,106 | 25,958,136 | **23,669,106** | 4.77x | 1,937 | 62 |
+
+And `bench/throughput.sh build-sk --reader-decode` (00:45 EDT): 5,064,618 /
+9,328,241 / 17,045,726 / 27,734,074 events/s at P = 1/2/4/8, with 937
+worker idle waits at P=8 against 161 on the default path in the run just
+before it. That is the same picture as the 19th: at P=8 the two are a wash
+and the raw-record path keeps the workers better fed.
+
+On the 19th the same harness gave 5.20M / 9.41M / 19.9M / 30.9M (5.94x).
+Today's P=8 is 12% lower on the first run and 23% lower on the second, and
+the two runs four minutes apart disagree by 13% at P=8. Before blaming the
+code, the evidence from the same minutes:
+
+- `uptime` load averages went 4.37 (00:45) to 7.07 (00:48) on a machine
+  that was otherwise idle on the 19th; `ps -r` showed `fseventsd` at
+  84.5% to 88.9% CPU throughout (the other track's agent was building and
+  this session had just written a 520 MB input, both of which the file
+  event daemon indexes) and a Chrome renderer at 23%.
+- The per-worker busy times at P=8 were 0.26 to 0.32 s against 0.25 to
+  0.28 s on the 19th: the workers themselves run at the same speed, within
+  the noise.
+- The serial merge took 0.071 to 0.095 s against 0.035 s on the 19th.
+  That is 68 MB of CSV copied through a file system whose event daemon is
+  busy; it is 0.04 to 0.06 s of the 0.05 s gap between a 0.32 s and a
+  0.37 s wall time at P=8, i.e. nearly all of it.
+- P=1 single runs taken during the same minute were 4.43M and 4.53M against
+  the harness's 5.03M median a few minutes earlier, so even the
+  single-thread number moved 12% with load; the P=8 gap is the same noise
+  applied to a 0.37 s run.
+
+So the difference is accounted for by I/O and load on the measuring
+machine, not by code: the workers' compute is unchanged and the extra wall
+time is in the merge. The one hot-path change since the m3 numbers is
+m4's reader, which gained two per-event branches (the marker check
+`handed_ == next_marker_at_` and the `--throttle-eps` test). Their cost
+cannot be separated from today's noise; a quiet-machine rerun is the
+right test and is the first step of m5's benchmark pass, together with the
+"what I would change" item of hoisting both checks to once per block if
+they show.
+
+What to quote until then: the 19th's table was taken on a quiet machine
+and is the better measurement; today's confirms correctness and the shape
+of the scaling (3.5 to 3.7x at 4 threads, 4.8 to 5.4x at 8) on the final
+code, and shows the harness's run-to-run spread under load, which m5's
+write-up has to state next to any single number.
+
+### Files touched this session
+
+`bench/throughput.sh` (mode only), `streamkit/README.md` (the two flags
+main.cpp already had but the README did not list, `--no-fsync` and
+`--latency-stats`, and the m3 status line), this file.
+
+## 2026-10-21: m4 re-verified on the finished tree, one durability gap closed
+
+**Why this entry exists.** The m4 entry above was written on 2026-10-19.
+This session re-ran every m4 "done when" check on the tree as it stands
+today (with the m5 emit-latency plumbing wired in), re-measured the
+checkpoint cost, and read the resume path once more with the crash table
+in hand. Every number below is from a command run in this session; the
+19th's numbers stay above as the first measurement.
+
+### One gap found and closed: the output rename was not made durable
+
+`merge_atomic` (pipeline.cpp) wrote `<out>.tmp`, fsync'ed it, renamed it
+over `<out>`, and returned. Every rename in `checkpoint.cpp` is followed by
+an fsync of the parent directory, for the reason given in the m4 entry: the
+rename lives in the directory's data, and until the directory is fsync'ed a
+power loss can keep the file and forget the name. The output rename skipped
+that step, and it is the one rename where the omission has teeth, because
+`run_pipeline` deletes the checkpoint directory right after it. Against a
+power loss in that window the file system was free to persist the deletion
+and lose the rename, leaving neither an output file nor a MANIFEST to resume
+from; the next `--resume` would start over from byte 0 (correct, but the
+whole run's work gone), and a user who did not pass `--resume` would see no
+output and no checkpoint and no explanation.
+
+Why SIGKILL never caught it: a killed process loses nothing the kernel
+already has, and `rename` is in the kernel's cache the moment it returns.
+Only a power cut or kernel panic between the rename and the next journal
+flush exposes the ordering, which no software harness on one machine can
+produce. The fix is one `durable_sync_dir(parent)` after the rename, the
+same call the checkpoint files already use, with a comment that says why.
+Cost: one directory fsync per run, after the last byte of output, which
+is below the run-to-run noise (1M events at 4 threads with checkpoints
+took 0.31 to 0.33 s wall with the fsync in place; the only pre-edit runs
+were taken under harness load and are not a fair comparison).
+
+Why not also fsync the directory after `remove_all(ckpt_dir)` and the part
+deletions? Losing those deletions is harmless: a stale checkpoint directory
+next to a finished output is exactly the "after output rename, before
+deleting the checkpoint dir" row of the crash table, and `--resume` replays
+the tail and rewrites the same bytes. The row that mattered was the one
+where the output could vanish.
+
+### What was re-run, and the result
+
+- **Warnings.** `touch` every source this track owns, then
+  `cmake --build build-sk --target streamkit streamkit_tests adstack_tests
+  oracle gen evdump`: 16 translation units recompiled, 0 lines matching
+  `warning:`; the ASan and TSan trees, configured fresh in this session,
+  also 0. Rebuilt again after the `merge_atomic` edit: 0.
+- **Unit tests.** `ctest --test-dir build-sk -R '^(...this track's
+  suites...)'`: 78/78 (16 in `adstack_tests`, 62 in `streamkit_tests`), in
+  Release, ASan+UBSan and TSan, before and after the edit. The m4 suites
+  are the 20 tests in `checkpoint_test.cpp` (4 `Snapshot.*`, 2
+  `Manifest.*`, 4 `Resume.*`, 1 `Coordinator.*`, 2 `DedupState.*`, 2
+  `WorkerResume.*`, 5 `PipelineCheckpoint.*`), covering the four things the
+  plan names: snapshot round trip, truncate-on-resume, manifest parsing,
+  partial-epoch detection.
+- **`bench/smoke.sh build-sk 200000 7`:** PASS at 1/2/4/8 threads,
+  tumbling and sliding, before and after the edit.
+- **`bench/crash.sh build-sk 50`, run twice** (2M events seed 11, 4
+  threads, checkpoint every 100K events, throttle 400K events/s, SIGKILL
+  after 0.2 to 3.0 s, `--resume` until exit 0, `compare.sh` against the
+  oracle):
+  - 00:52 EDT, binary before the edit: **50/50 PASS, 392,549 windows
+    identical in every trial, 148 kills, 46 of 50 trials killed at least
+    twice, 1 trial not killed at all, at most 5 kills in one trial.**
+  - 00:58 EDT, final binary: **50/50 PASS, 136 kills, 43 of 50 trials
+    killed at least twice, 1 trial not killed, at most 6 kills.**
+  The final run of every trial reports which epoch it resumed from (10 to
+  20 of the 20 epochs in the stream), so the kills landed throughout the
+  run, not only at the start. No trial left a part file, a `.tmp` output or
+  the checkpoint directory behind (the harness checks).
+- **Edge cases by hand** (final binary): `--in -` piped from `cat` with
+  `--ckpt-dir` exits with "needs a seekable input file; stdin or a pipe
+  cannot be rewound on resume"; a directory left by a run killed after
+  epoch 3 is refused without `--resume` ("holds a previous run; pass
+  --resume to continue it or remove it"); `--resume` with a different
+  `--lateness-s` is refused ("flags differ from the checkpoint's"); with
+  matching flags it resumes from epoch 3 at offset 15,600,008 and finishes;
+  `cat MANIFEST` shows the eight `key value` lines.
+- **ASan+UBSan (`build-sk-asan`)**, final binary: 1M events (`gen --seed
+  1`) at 4 threads, `--lateness-s 60 --late-out`, checkpoint every 100K
+  events, throttled to 150K events/s, SIGKILLed every 3 s: 2 kills, resumed
+  from epoch 8, 205,806 windows identical to the oracle, 0 lines matching
+  `Sanitizer|runtime error`.
+- **TSan (`build-sk-tsan`)**, final binary: same input and flags at 100K
+  events/s, SIGKILLed every 4 s: 3 kills, resumed from epoch 9, 205,806
+  windows identical, 0 lines matching
+  `Sanitizer|ThreadSanitizer|runtime error|data race`.
+
+### Checkpoint cost, re-measured
+
+Apple M5 Pro, 18 hardware threads, APFS on the internal SSD, Release,
+`build-sk/bin/streamkit`, input `gen --n 1000000 --seed 1`, load average
+4.9 at the time (the other track's agent was active; a quieter machine than
+during the harness runs, which ran at the same time as a first attempt at
+these numbers and inflated them by 40 to 80%). Three runs each; the
+`checkpoints:` line of the stderr summary is the source.
+
+The plan's "100K open windows" case, 1 thread, `--lateness-s 0`,
+`--checkpoint-every-events 250000` (4 snapshots per run):
+
+| | snapshot bytes | open windows | slowest snapshot | all 4 snapshots | wall |
+|---|---|---|---|---|---|
+| with fsync (default) | 9,072,065 | 97,952 | 31.2 / 31.2 / 31.9 ms | 119 / 112 / 111 ms | 0.31 / 0.29 / 0.29 s |
+| `--no-fsync` | 9,072,065 | 97,952 | 17.1 / 17.1 / 19.6 ms | 58 / 60 / 66 ms | n/a |
+| no checkpoints | | | | | 0.19 / 0.18 / 0.18 s |
+
+So a 9.07 MB snapshot of 98K open windows costs about 28 to 30 ms, of
+which 13 to 15 ms is the three durable syncs (part file, snapshot,
+directory) and the rest is serializing 98K windows plus ~500K dedup ids and
+hashing the bytes. The size is deterministic (same bytes in every run and
+in the 19th's measurement): 44 bytes per open window and 8 per dedup id.
+
+The harness setting, 4 threads, `--lateness-s 60`, every 100K events (10
+epochs, 40 snapshots per run): 16,615,820 bytes per epoch summed over the
+four workers (197,664 open windows summed, ~4.2 MB per worker), slowest
+single snapshot 33.7 / 36.5 / 37.0 ms, 0.86 / 0.97 / 0.95 s of snapshot
+time in total (21 to 24 ms per snapshot), wall 0.31 / 0.33 / 0.33 s against
+0.07 / 0.08 / 0.07 s without checkpoints. That is the cost of checkpointing
+every 30 ms of input at benchmark speed, which is the density the crash
+test needs and 10 to 100 times more often than anyone would run; the m4
+entry's arithmetic for realistic intervals still holds.
+
+### Files touched this session
+
+`streamkit/pipeline.cpp` (the directory fsync in `merge_atomic` and its
+comment), `streamkit/README.md` (the m4 status line), this file.
+
+## 2026-10-21: m5, benchmarks and the emit-latency metric
+
+**Problem.** The plan's m5 is a table: throughput vs threads, p50/p99
+emit latency under paced replay, memory, dedup overhead, every cell
+reproducible by `bench/throughput.sh`. Two of those are plain
+measurements. The third, latency, first needs a definition that cannot be
+mistaken for something it is not: an engine that closes windows on a
+watermark has no single "the event was processed" moment to time, and
+every obvious definition measures something other than the engine. This
+entry records the definition, why it is that one, how the harness is
+built, what the numbers turned out to mean (one of them was a surprise),
+and what I would change next. The numbers themselves, with the machine,
+load and command for each, are in `BENCHMARKS.md`; this entry quotes only
+the ones it argues about.
+
+### Decision 1: emit latency is read(2)-to-row, per watermark-closed window, per worker
+
+For every window that a worker's watermark closes, the sample is
+`t_row - t_block`: `t_block` is `steady_clock` read by the reader right
+after `read(2)` returned the block of bytes holding the event that pushed
+this worker's watermark past the window's end; `t_row` is `steady_clock`
+read by the worker right after `fprintf` appended that window's row to its
+output stream. p50/p99 are nearest-rank percentiles over the run's samples.
+It excludes the allowed lateness (event time, configured, not a cost of
+the engine), the producer's buffering before the bytes reach the process,
+the stdio flush to disk, the final merge, and windows closed by end of
+input. In one sentence for an interviewer: it is the time from "the
+process could first have known the window was closable" to "the row
+exists", and nothing else.
+
+Why that and not the alternatives:
+
+- **Not `t_row - ingest_time` of the closing event.** `ingest_time` is
+  data. With `gen --pace` it tracks the wall clock within gen's own
+  buffering, so this would measure gen's pacing accuracy plus its 1 MiB
+  write buffer (measured: ~100 ms bursts, below) ahead of anything the
+  engine does; with the Criteo file it would be days. A benchmark number
+  that depends on the producer's clock is not a number about the engine.
+- **Not a stamp per event.** That is 8 more bytes per event through the
+  queue and a clock read per event (tens of nanoseconds against a ~200 ns
+  per-event budget), on by default or behind a branch in the hot loop
+  either way. A stamp per input block is one clock read per `read(2)` and
+  loses no precision about arrival: every event in a block entered the
+  process at the same instant, which is the instant stamped. On a file the
+  reader runs ahead of the workers and a batch can straddle two blocks; it
+  carries the earlier stamp, so a sample is never understated (pipeline.h
+  says so at the field). On a pipe every short read flushes the partial
+  batches, so batches never straddle.
+- **Per-worker watermark, not "when could any worker have known".** The
+  engine closes a window when *its* partition has seen an event past the
+  end plus lateness; that is the semantics being measured. A global
+  watermark (min over workers) closes later, never earlier, so the
+  per-worker instant is the earliest any engine with this partitioning
+  could close the window, which is what "could first have passed" has to
+  mean. The gap to the first qualifying event in *any* partition is one
+  partition inter-arrival time, about P x 5 us at 200K events/s.
+- **Stop the clock after `fprintf`, not after flush or fsync.** The row is
+  available to the engine's consumer once it is in the stream; the 1 MiB
+  flush happens every ~23K rows and belongs to no particular window, and
+  fsync is a checkpoint matter. Timing the flush would make the p99 a
+  statement about stdio's buffer size.
+- **Exact samples, not a histogram.** 4 bytes per closed window while the
+  flag is on (5.8 MB for the 20 s run); nearest-rank percentiles are
+  always a value that was observed, which is easier to defend than an
+  interpolated one; a histogram needs bucket boundaries chosen before the
+  distribution is known. `latency.h` has the arithmetic and
+  `tests/latency_test.cpp` pins it on inputs whose answer is known.
+- **Flag-gated, zero cost off.** `Config::latency_stats` is tested in the
+  reader once per block and in `close_ready` once per call; with it off no
+  clock is read and nothing is stored (`Latency.OffByDefaultRecordsNothing`).
+- **End-of-input closings are not samples.** They are not watermark
+  closings; including them would add one sample per still-open window at
+  EOF with a value that means "how long since the last block", which is
+  not latency.
+
+Two additions after the first run, both so the write-up could be checked
+rather than believed: `min` next to p50/p99/max, because the samples
+turned out to be spread uniformly from the min (the first row of a
+closing burst, the pure path through queue, decode and close) to the max
+(the last row, charged for every row before it), and `input reads` on the
+same line, because the arrival granularity of the stamps on a pipe is the
+producer's write pattern and should be printed, not assumed.
+
+### Decision 2: the harness
+
+`bench/throughput.sh` grew from one table to five sections (`threads`,
+`dedup`, `checkpoint`, `memory`, `latency`), selectable with `--only`, with
+the machine, build, load average, input and exact command printed above
+every table, three runs per cell with the median in bold and all three
+shown, and the cached inputs generated once by seed.
+
+- **Runtime flags, not build flags, for the variants.** `--no-dedup`,
+  `--checkpoint-every-events`, `--queue-depth` compare one binary with one
+  variable changed. A build flag compares two binaries whose code
+  generation differs everywhere, and the difference measured is then the
+  compiler's, not the feature's. The cost is that `--no-dedup` exists in a
+  shipping binary; it is documented as a measurement knob and produces
+  wrong output on purpose.
+- **Medians of three with the spread shown**, because the machine was
+  never idle (the other track's agent built and tested in a sibling
+  directory the whole time; load average 3.5 to 4.5 on 18 cores). The
+  4-thread cell of the first run (12.2M, 14.6M, 18.8M events/s within
+  seconds of each other) is the argument for showing all three: a median
+  alone would have hidden a 50% spread.
+- **`gen --pace` into a pipe for latency, not `--throttle-eps` on a file.**
+  `--throttle-eps` paces the reader *after* `read(2)`, so the stamp would
+  sit before the throttle sleep and the samples would include it;
+  `--pace` puts the pacing upstream of the stamp, and it exercises the live
+  path (short reads, partial-batch flushes) rather than the file path.
+- **200K events/s, 1 s windows, 2 s lateness, 20 s.** Twenty times the
+  generator's native rate, chosen so that something closes: with 100K
+  campaigns about 86K windows close per second of stream, which is the
+  emission path under load. A 60 s window would close nothing in 20 s;
+  with 1 s / 2 s the first closing is at t = 3 s and the run has 17
+  boundaries and 1.46M samples. A first 3 s trial run produced only the
+  sparse negative-time windows from late events and a p99 of 2 ms that
+  meant nothing; the harness runs 20 s for that reason.
+
+### What the numbers say
+
+Full tables in `BENCHMARKS.md`. The parts that needed interpreting:
+
+- **Throughput.** Two harness runs, 17 minutes apart: 5.05M / 9.35M /
+  14.6M / 27.3M and 4.45M / 8.76M / 18.3M / 26.3M events/s at 1 / 2 / 4 / 8
+  threads (5.4x and 5.9x at 8). The 19th's idle-machine table (5.20M /
+  9.41M / 19.9M / 30.9M) remains the best measurement of the code; today's
+  runs bound what a loaded machine gives and are reported as such.
+- **Dedup costs 51 ns per event**, the same on a dirty and on a clean
+  stream (1/5.01M - 1/6.73M and 1/4.99M - 1/6.70M at 1 thread): one hash
+  insert that misses cache, paid whether or not a duplicate is found. The
+  m2 entry said 13% and this says 25.6%, and both are right: m2's baseline
+  was the whole single-threaded loop including the read; since m3 the read
+  is on another thread, the no-dedup worker is faster (6.7M against 5.9M),
+  and the same 51 ns is a larger share of a smaller number. Quote the
+  nanoseconds.
+- **Checkpoints cost exactly their snapshots.** 2.591 s of snapshot time
+  over 80 snapshots is 32 ms each; 10 epochs x 32 ms = 0.32 s, and the wall
+  time grew by 0.317 s (0.354 to 0.671 s). At any interval a real stream
+  would use (the default is one checkpoint per 100 s at the generator's
+  native rate) that is 0.03%.
+- **State is flat; the queues are not.** 1M to 10M events at 1 thread is
+  92.5 to 102.4 MiB with the dedup set at 0.99M to 1.19M ids and the
+  open-window map at ~200K in both. At 8 threads the default 4096-slot
+  queues (27 MB per worker) are touched only when the reader runs that far
+  ahead, which it never fully does on 1M events and always does on 10M, so
+  130 to 334 MiB; `--queue-depth 256` gives 87 to 137 MiB. The remaining
+  50 MiB at 8 threads with shallow queues is 10 MiB of ids plus allocator
+  slack from the bucket expiry that only begins once the stream is longer
+  than the 120 s horizon; whether it keeps growing past 10M is not
+  measured and is listed below.
+- **Emit latency: p50 6.7 ms, p99 12.9 ms at 8 threads; p50 13.4 ms, p99
+  23.3 ms at 1 thread**, on top of the 2 s lateness, at 200K events/s with
+  86K windows closing per second. The decomposition, each step from a run
+  in `BENCHMARKS.md` section 5:
+  1. The producer's pattern is measured, not assumed: gen's writer buffers
+     1 MiB, so at 200K events/s the pipe receives ~990 KB bursts every
+     ~100 ms, which the reader consumes in 64 KiB pieces (1,186 events per
+     `read(2)`, the "input reads" column).
+  2. With 1K campaigns (141 rows per worker per boundary) the p99 is still
+     1.27 ms at 8 threads and 3.0 ms at 1: that is the closing event
+     waiting behind the rest of its ~20K-event burst, which one worker
+     processes in ~3 ms and eight in ~1.3 ms each. This floor is the
+     producer's burst, not the queue; a producer that flushed per event
+     would not show it.
+  3. Everything above the floor is rows written one after another: all of
+     a worker's windows for a second close in one call. `--no-dedup` and
+     `--batch 16` move the p99 by under 1 ms, so bucket expiry and batching
+     are not it.
+  4. The surprise: **the cost per row is 0.24 us when one worker writes
+     and 1.0 to 1.1 us when eight write at once**, and at eight threads it
+     is the same ~1.0 us per row at 6.3K, 10.8K and 15.4K rows per burst
+     (50K, 100K, 200K campaigns). So it is a per-row cost that grows with
+     the number of concurrently emitting workers, not a per-burst fixed
+     cost (which rules out the other candidate, one serialized 1 MiB
+     `write(2)` per worker per flush: that would be a constant). The
+     busy-time counters agree: the same work costs 4 x 0.15 s of worker
+     time at P=4 and 8 x 0.145 s at P=8. Two things are in the row path,
+     libc `fprintf` (the FILE lock plus the formatter) and `std::map::erase`
+     (a node free through the process-wide allocator), and one of them
+     scales badly across threads on this libc; telling them apart needs a
+     code change and is the first item below. The core layout of the M5
+     Pro (6 + 12) was checked as an explanation and rejected: P=5 (six
+     threads with the reader) and P=6 (seven) both give 11.5 ms.
+  5. The consequence is a sweet spot at 4 threads for this workload (p99
+     8.4 ms, against 12.4 ms at 2, 11.5 at 5 and 6, 12.9 at 8, 12.5 at 12):
+     past four workers the fall in rows per worker is cancelled by the
+     rise in cost per row. Throughput and emit latency have different
+     optimal P on this machine, and the harness is what shows it.
+
+### What it costs
+
+- Measurement: with `--latency-stats`, one `steady_clock` read per input
+  block in the reader, one per emitted row in the worker, and 4 bytes per
+  watermark-closed window held until exit (5.8 MB for the 20 s run). Off,
+  one predictable branch per block and per `close_ready` call. The
+  `input_reads` counter is one increment per block, always on.
+- Harness: about 3.5 minutes for all five sections and 1.1 GB of cached
+  inputs in `/private/tmp/adstack-sk`. Removed after this session's runs.
+
+### How it was verified
+
+- Warnings: 0 across `build-sk`, `build-sk-asan`, `build-sk-tsan` after
+  touching every source this track owns (10 translation units per tree
+  before the m5 edits, 5 after). Tests: 16 + 63 = 79 passed in each of the
+  three builds, run from the test binaries directly; the 8 `Latency.*`
+  tests cover the percentile arithmetic, the clamp, one sample per
+  watermark-closed window and none at EOF, nothing recorded when the flag
+  is off, samples from every worker, and (new) the block counter on a
+  file larger than one block.
+- `bench/smoke.sh build-sk`: PASS at 1/2/4/8 threads, tumbling (92,609
+  windows identical) and sliding (436,985), 1,951 dups in every run equal
+  to the oracle's.
+- `bench/crash.sh build-sk 50`: 50/50 PASS, 125 kills, 44 trials killed
+  at least twice, no leftovers.
+- ASan+UBSan and TSan on the paced latency path (500K events at 100K
+  events/s, 4 and 8 threads, `--latency-stats --late-out`): exit 0, zero
+  sanitizer lines, 310,446 windows written in each run.
+- The harness's parsing was checked against the raw stderr lines in the
+  inline experiments (the same `emit latency` line, read by eye).
+
+### What I would change next
+
+1. **Format rows without libc `printf`, and erase closed windows in bulk.**
+   A hand-rolled unsigned-to-ASCII into a worker-owned buffer with a
+   `write(2)` when full removes the FILE lock and the formatter from the
+   row path; `open_.erase(begin, it)` after the loop replaces one free per
+   row with a batch of frees (or, further, an arena for map nodes so no
+   free happens at all until the arena is recycled). The target is the
+   P=1 per-row cost (0.24 us) at P=8, which would bring the p99 at this
+   workload from 12.9 ms to about 4 ms and restore the expectation that
+   more workers means lower emit latency. The harness's latency section is
+   the acceptance test, and the first run tells which of the two was the
+   culprit.
+2. **A replayable-log source (Kafka) with offset commit tied to the
+   checkpoint epoch.** The manifest already records "input offset X"; for
+   a partitioned log it records a map of partition to offset, captured by
+   the reader when it injects the marker, and the consumer group's offsets
+   are committed only after the MANIFEST rename, never before. A crash
+   between snapshot and commit then replays from the last committed
+   offsets into the same truncate-and-replay that resume already does, so
+   the pipeline is exactly-once end to end without idempotent sinks. It
+   needs one marker per source partition and the reader to hold new
+   partition assignments until the epoch boundary. This is the change
+   that turns the engine from a file tool into a service.
+3. **Incremental snapshots.** Half of every snapshot is dedup ids that
+   barely change between epochs (one bucket appended, one expired), and the
+   open windows change mostly at the front. A base snapshot plus per-epoch
+   deltas (new buckets, count of expired buckets, windows touched since the
+   last epoch, part-file lengths), compacted into a new base every k
+   epochs, cuts the bytes per epoch by roughly the horizon / interval ratio.
+   The cost is a chain to validate on resume (each delta hashed and bound
+   to its predecessor) and resume time that grows with k. Not worth it at
+   2.3 MB per worker per epoch; it is the right design once open state is
+   a hundred times larger (long windows, many keys), which m4's
+   "stop-the-world" note already said.
+4. **Watermark alignment across partitions for ordered output.** Each
+   worker publishes its watermark through one atomic; a merger pulls
+   closed rows from P per-worker queues and emits them in window-start
+   order only up to the minimum watermark. The output becomes globally
+   time-ordered, which lets colstore ingest it pre-sorted and prune by
+   zone map without a sort, and it is also the natural place to move the
+   checkpoint fsync off the workers. The cost is that the slowest
+   partition holds every partition's rows back, so emit latency becomes
+   the max over partitions; on this workload that is bounded by the burst
+   anyway, but a stalled partition would stall the output, which is
+   exactly the trade the m3 entry chose against for the per-worker
+   watermark. Worth doing behind a flag.
+5. **Make `gen --pace` flush on every sleep** (`tools/gen.cpp`, root-owned,
+   so not changed here). The 1 MiB write buffer turns a paced stream into
+   100 ms bursts and puts a 1.3 to 3 ms floor under every latency sample;
+   with per-sleep flushes the pipe would carry events as they are produced
+   and the measurement would show the queue handoff itself.
+6. **A 100M-event memory run** to settle whether the 50 MiB of allocator
+   slack at 8 threads is bounded; and the flat open-addressing dedup set
+   from the m2 entry, which would halve the bytes per id that the memory
+   table is made of.
+
+### Files touched this session
+
+`bench/throughput.sh` (five sections, `--only`), `streamkit/latency.h`
+(`min_us`), `streamkit/pipeline.h` and `pipeline.cpp` (`input_reads`),
+`streamkit/main.cpp` (the latency line), `streamkit/tests/latency_test.cpp`
+(min, block counter, one new test), `streamkit/BENCHMARKS.md` (new),
+`streamkit/README.md` (status, harness usage, files), this file.
+
+## 2026-10-21: integration with colstore, the CSV boundary
+
+**What landed.** `bench/e2e.sh` runs the whole pipeline on 5M dirty events
+(1% duplicates, 5% late up to 30 s, `--rate 1000` so the stream spans 83
+one-minute windows): `gen -> oracle -> streamkit --threads 4 --ckpt-dir ...
+--checkpoint-every-events 1000000 -> bench/compare.sh -> colstore ingest`
+of both the raw events and streamkit's output `-> verify -> Q1-Q3 -> top-10
+campaigns by spend in one hour on the aggregate table`, with every answer
+checked against a brute-force recomputation and the final top-10 also
+recomputed by awk from the ORACLE's CSV. One report, exit 1 on any
+mismatch (proved by a one-off run with a wrapper `oracle` that added 1 to
+one cost: `E2E FAIL`, exit 1). Nothing in streamkit changed; the only
+edits on this side are this entry and one README line.
+
+**The boundary between streamkit and colstore is streamkit's CSV, as is.**
+colstore learned to ingest it (`--in-csv`, a 6-integer-column table with
+the schema carried in the `.col` footer) rather than streamkit learning
+to write `.col` or a shared binary record. Why CSV, for now:
+
+- It already existed and was already proved: `bench/compare.sh` diffs it
+  against the oracle byte for byte, so the integration added no new
+  format and no new way to be wrong between the two engines. colstore's
+  `verify --csv` then proves its own copy against the same file, and the
+  e2e's awk step recomputes the final answer from the oracle's CSV with
+  no code from either engine.
+- The checkpoint/resume design depends on the output being an append-only
+  byte stream whose length is the state (snapshot records `bytes written`,
+  resume truncates to it, m4 entry). A row-oriented text file has exactly
+  that property. A `.col` output would not: the footer is written last,
+  row groups are 65,536 rows, and a crash mid-group would need its own
+  recovery story, which is a second checkpoint protocol.
+- Cost, measured in the e2e: streamkit writes 3,735,840 rows (127 MB of
+  text) in 0.60 s wall for 5M events; colstore parses them with
+  `std::from_chars` at 7.2M rows/s (0.52 s) into 16.6 MB of `.col`, i.e.
+  the CSV is 7.7x the columnar bytes. Both numbers are below the oracle's
+  own 1.4 s and far below the 10 s `compare.sh` spends sorting the same
+  rows twice. At this scale the text boundary is not where the time goes.
+
+**What a binary or Arrow-style boundary would buy.** Three things,
+roughly in order of value:
+
+1. *Bytes and parse time.* A fixed-width 36-byte record (i64, u32, 3 x
+   u64, i64, mirroring `common/event.h`) is 134 MB for these rows, barely
+   smaller than the 127 MB of text because decimal integers are short;
+   the real saving is the parse: a `memcpy` per record instead of six
+   `from_chars`, which at 7.2M rows/s today is about half of colstore's
+   ingest time for the aggregate table. An Arrow IPC stream (one record
+   batch per flushed group of windows, columnar inside) goes further:
+   colstore could take each batch's columns without a transpose and
+   encode them directly.
+2. *Types travel with the data.* The CSV's schema is a convention held in
+   two places (`write_csv_header` in `common/agg.h` and
+   `aggregate_schema()` in colstore's `format.h`) and enforced by a header
+   string compare. A self-describing boundary carries names and types in
+   the stream, so a new column in streamkit's output would be a new column
+   in colstore's table instead of a rejected header.
+3. *Streaming, not files.* With an Arrow stream colstore could ingest from
+   streamkit's stdout as windows close, which is the actual pipeline
+   shape; today the CSV is complete before ingest starts.
+
+What it would cost: a third format in the repository (or a dependency on
+Arrow, which the plan forbids), a resume rule for a block-structured
+output (snapshot the block boundary, not a byte length), and a second
+diff tool, since `compare.sh` reads text. None of that is needed for a
+pipeline whose stages run one after another on one machine, which is
+why the boundary stays as it is and this entry records what would change
+it: either an ingest that has to keep up with streamkit live, or a column
+added on one side that the other must pick up without a code change.
+
+**Verified.** `bench/e2e.sh build-int` (Release): E2E PASS, streamkit
+5,000,000 events, 49,791 dups, 3,735,840 windows in 0.60 s at 4 threads,
+5 checkpoint epochs committed, `compare.sh` PASS 3,735,840 windows
+identical; the same at 1M events under ASan+UBSan and TSan trees with 0
+reports (colstore's NOTES entry has the full table and the colstore-side
+costs). The run uses `--lateness-s 60` against a 30 s maximum lateness,
+so 0 events were late-dropped; the dedup count equals the oracle's.

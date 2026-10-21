@@ -34,6 +34,11 @@ namespace adstack {
 
 struct LatencySummary {
   size_t count = 0;    // windows the watermark closed
+  // min is reported next to the percentiles because windows close in bursts
+  // (every campaign's window for a given second closes on the same event):
+  // the first row of a burst is the pure path through queue, decode and
+  // close, the later rows are charged for the rows written before them.
+  uint32_t min_us = 0;
   uint32_t p50_us = 0;
   uint32_t p99_us = 0;
   uint32_t max_us = 0;
@@ -54,13 +59,14 @@ inline uint32_t percentile_nearest_rank(const std::vector<uint32_t>& sorted, dou
 }
 
 // Sorts the samples in place (they are not needed in arrival order) and
-// returns p50, p99 and max. Empty input gives an all-zero summary with
+// returns min, p50, p99 and max. Empty input gives an all-zero summary with
 // count = 0, which main.cpp reports as "no windows closed by the watermark".
 inline LatencySummary summarize_latency(std::vector<uint32_t>& samples_us) {
   LatencySummary s;
   s.count = samples_us.size();
   if (samples_us.empty()) return s;
   std::sort(samples_us.begin(), samples_us.end());
+  s.min_us = samples_us.front();
   s.p50_us = percentile_nearest_rank(samples_us, 0.50);
   s.p99_us = percentile_nearest_rank(samples_us, 0.99);
   s.max_us = samples_us.back();
