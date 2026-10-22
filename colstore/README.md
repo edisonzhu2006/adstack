@@ -445,6 +445,14 @@ skipped, 6,990,857 rows, 100,000 groups in 262,144 slots after 8 doublings,
 at eight threads; ASan+UBSan and TSan clean on the 10M file; details in
 NOTES.md.
 
+Second re-run the same afternoon (clean rebuilds again, no code change):
+the script's m4 stage landed at load 4.9-6.9 and read 2x slower across
+the board (its m3 scans and decode-only times moved by the same factor),
+and a re-time four minutes later at load 3.3 gave 0.050 / 0.093 / 0.176 s
+at one thread and 0.008 / 0.038 / 0.065 s at eight, within 5% of the
+table above; every count identical, all five `--check` PASS in Release,
+ASan+UBSan and TSan. NOTES.md has both sets of numbers and the reasoning.
+
 ORDER BY on the 100,000-row Q3 result: full sort 7.1 ms; `LIMIT 20` 0.2 ms;
 `LIMIT 1000` 0.6 ms (`std::partial_sort`, a heap of N). Batch size with
 the aggregate attached (`--vector`): 1024 / 8192 / 65536 rows give
@@ -470,27 +478,31 @@ cache, indexes on `(event_time_us)`, `(country, event_type)`,
 `mmap_size`, three runs on one connection after an untimed first run,
 median. Every query is run on SQLite both as the planner chooses and
 with `NOT INDEXED`; the better one counts. Answers identical on all three
-(CSV diff). Full detail, plans and the write-up: [BENCHMARKS.md](BENCHMARKS.md).
+(CSV diff). Numbers from the quietest of seven runs on 2026-10-21 (the
+machine was shared; all seven, and why that one, are in
+[BENCHMARKS.md](BENCHMARKS.md) with the plans and the write-up).
 Command: `bench/colstore_bench.sh build-cs 10000000 /private/tmp/adstack-cs m5`.
 
 | | `.ads` raw | `.col` | `.sqlite` table | `.sqlite` + indexes |
 |---|---:|---:|---:|---:|
-| bytes | 520,000,008 | 160,200,997 (0.31x) | 488,329,216 (0.94x) | 899,682,304 (1.73x) |
-| load, median of 3 | | 1.313 s | 3.066 s insert | + 12.878 s indexes + 0.585 s ANALYZE = 16.529 s |
+| bytes | 520,000,008 | 160,201,178 (0.31x) | 488,329,216 (0.94x) | 899,682,304 (1.73x) |
+| load, median of 3 | | 1.215 s | 2.781 s insert | + 11.870 s indexes + 0.552 s ANALYZE = 15.223 s |
 
 | query | SQLite planner | SQLite `NOT INDEXED` | colstore 1 thread | colstore 8 threads | 1 thread vs best SQLite |
 |---|---:|---:|---:|---:|---:|
-| Q1 point filter + count | **0.0028 s** | 0.2361 s | 0.055 s | 0.008 s | 0.05x (SQLite 19.6x faster: covering index) |
-| Q2 1 h range, GROUP BY campaign_id | 5.0051 s | **4.0084 s** | 0.094 s | 0.042 s | **42.6x** |
-| Q3 full GROUP BY, 4 aggregates | **5.2669 s** | 7.5260 s | 0.188 s | 0.069 s | **28.0x** |
+| Q1 point filter + count | **0.0028 s** | 0.2664 s | 0.063 s | 0.009 s | 0.04x (SQLite 22.5x faster: covering index) |
+| Q2 1 h range, GROUP BY campaign_id | 5.1766 s | **4.1553 s** | 0.098 s | 0.040 s | **42.4x** |
+| Q3 full GROUP BY, 4 aggregates | **5.4385 s** | 6.8925 s | 0.181 s | 0.068 s | **30.0x** |
 
 Q2's zone map skips 45 of 153 row groups (29.4%). colstore wins the two
 GROUP BY queries because it reads three columns instead of reconstructing
 rows, scans encoded data, and skips row groups from the footer; SQLite
 wins the equality count because a covering B-tree index answers it in
 time proportional to the 269,609 matches, and colstore has no secondary
-index (what would fix that is item 1 of "what I would change next" in
-NOTES.md).
+index (what would fix that is on the "what I would change next" list in
+NOTES.md). Across the seven runs the GROUP BY ratios ranged from 22.7x to
+50.1x (Q2) and 8.7x to 30.4x (Q3); the counts, sizes and plans did not
+move.
 
 ## Status
 
@@ -506,8 +518,9 @@ NOTES.md).
       predicates on codes, `--where` parser, `colstore scan`,
       `verify --where` against brute force (4 predicates PASS on 10M rows),
       66 colstore unit tests, ASan+UBSan clean; 60 s time range skips 138
-      of 153 groups and runs in 6 ms; re-verified 2026-10-21 from a clean
-      rebuild (counts identical, times within 5%, ASan and TSan clean)
+      of 153 groups and runs in 6 ms; re-verified twice on 2026-10-21 from
+      clean rebuilds (counts identical both times, batched times within
+      5%, ASan and TSan clean; see NOTES.md)
 - [x] m4: hash aggregate (own open-addressing table, packed 128-bit keys,
       count / sum / min / max / count_if / sum_if), ORDER BY / LIMIT with
       partial sort, `colstore q` with CSV output and `--check` against a
@@ -518,7 +531,9 @@ NOTES.md).
       threads, all three `--check` PASS; re-verified 2026-10-21 from a
       clean rebuild (counts identical, times within 13% under background
       load, ASan and TSan clean; fixed a temp-file name collision in the
-      test helper that failed 10 fixture tests under `ctest -j 8`)
+      test helper that failed 10 fixture tests under `ctest -j 8`);
+      re-verified a second time the same day (counts identical, re-timed
+      within 5% of the table once the load dropped, ASan and TSan clean)
 - [x] m5: `colstore_sqlite` (C++ loader over the sqlite3 C API, optional
       target, schema from the column table, PRAGMAs as data), 9 tests (114
       colstore tests), `bench/colstore_bench.sh` extended with the SQLite
@@ -526,7 +541,12 @@ NOTES.md).
       `.col` 0.31x raw vs SQLite 1.73x with indexes, ingest 1.3 s vs 16.5 s,
       Q2 42.6x and Q3 28.0x faster than SQLite's best plan single-threaded
       (95x / 76x at 8 threads), Q1 lost 19.6x to the covering index;
-      answers identical across engines; ASan+UBSan and TSan clean
+      answers identical across engines; ASan+UBSan and TSan clean;
+      re-verified 2026-10-21 13:35 from a clean rebuild: 207/207 tests,
+      ASan and TSan clean, seven script runs on a shared machine with
+      counts, sizes, plans and the cross-engine diff identical every
+      time, quietest run Q2 42.4x / Q3 30.0x / Q1 lost 22.5x
+      (BENCHMARKS.md rewritten from that session)
 - [x] integration (2026-10-21): format version 2 carries the schema in the
       footer; `ingest --in-csv` takes streamkit's aggregate CSV as a
       6-column table, `verify --csv` and `q --check-csv` prove it, and
@@ -540,4 +560,4 @@ NOTES.md).
       (0.13x the CSV bytes), ASan+UBSan and TSan e2e runs clean; event
       ingest unchanged after the generic writer (PLAIN 0.467 s, auto
       1.226 s best of 3 on 10M rows, files byte-identical but for the
-      181-byte schema), 128 colstore tests, 207/207 ctest in all trees
+      181-byte schema), 128 colstore tests, 207/207 ctest in all trees; re-verified 2026-10-21 13:50 EDT from fresh configures: 0 project warnings, 207/207 in Release, ASan+UBSan and TSan, e2e PASS twice at 5M (load 10.3 and 4.9, counts identical; aggregates ingested in 0.677 s), ASan and TSan e2e at 1M with zero reports, forced mismatch exits 1 (NOTES.md)

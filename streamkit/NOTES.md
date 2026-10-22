@@ -1051,6 +1051,132 @@ entry's arithmetic for realistic intervals still holds.
 `streamkit/pipeline.cpp` (the directory fsync in `merge_atomic` and its
 comment), `streamkit/README.md` (the m4 status line), this file.
 
+## 2026-10-21 (afternoon): m4 re-verified from a fresh configure, third crash-harness pass
+
+**Why this entry exists.** This session was handed the m4 milestone with the
+tree already at m5 plus the colstore integration. Rather than re-implement
+anything, it checked every item of the m4 brief against the code and the two
+entries above, then re-ran every "done when" check from a fresh
+`cmake` configure of all three trees. Nothing in the code needed changing;
+this entry is the evidence for today's tree and one measurement lesson. The
+numbers from the 19th and this morning stay above as earlier measurements.
+
+### The brief, item by item, and where each lives
+
+| brief item | where | checked by |
+|---|---|---|
+| marker every N events carrying (epoch, offset X), in-band after the last event before X | `Reader::inject_marker` flushes partial batches, then one marker batch per queue | `PipelineCheckpoint.*`, the harness |
+| worker snapshots (open windows, dedup buckets, part length) to `.tmp`, fsync, rename `.snap` | `Worker::checkpoint`, `atomic_write_file`; format documented at the top of `checkpoint.h` | `Snapshot.*`, `WorkerResume.*` |
+| manifest written when all P snapshots exist, rename is the commit, k-1 deleted | `CheckpointCoordinator::snapshot_written` (last arriver commits) | `Coordinator.LastArriverCommitsAndDeletesPreviousEpoch` |
+| `--resume` loads snapshots, truncates parts, seeks input; stale dir without `--resume` is an error | `plan_start`, `open_outputs_resumed`, `truncate_part` | `PipelineCheckpoint.FailAfterCheckpointThenResumeIsByteIdentical`, by hand below |
+| partial epoch ignored; k-1 left behind cleaned; concat to tmp then rename; input exhausted still atomic | `prepare_resume`, `merge_atomic`, merge order in `run_pipeline` | `Resume.*`, `PipelineCheckpoint.CheckpointsCommitAndDirectoryIsRemovedOnSuccess` |
+| `--throttle-eps` | `Reader::run`, checked every 1024 events | the harness kills 149 times in 50 trials |
+| `bench/crash.sh`, 50 trials, per-trial kills and result, nonzero exit on any failure | `bench/crash.sh` | run below |
+| pipe input fails clearly | `BlockReader::seekable` in `plan_start` | `PipelineCheckpoint.PipeInputCannotBeCheckpointed`, by hand below |
+| F_FULLFSYNC on Apple | `durable_sync`, `EventWriter::sync` | read; the `--no-fsync` column below is what it costs |
+
+### What was re-run, and the result
+
+- **Configure and warnings.** All three trees re-configured with
+  `cmake -S . -B <dir> -G Ninja -DCMAKE_BUILD_TYPE=Release
+  -DADSTACK_SANITIZE=<none|address|thread>`, every source this track owns
+  touched, then `cmake --build <dir> --target streamkit streamkit_tests
+  adstack_tests oracle gen evdump`: 16 translation units recompiled per
+  tree, 0 lines matching `warning:` in each.
+- **Unit tests.** `build-*/bin/adstack_tests` and `build-*/bin/streamkit_tests`
+  run directly: 16 + 63 = 79 passed in Release, ASan+UBSan and TSan, 0
+  lines matching `Sanitizer|runtime error|data race` in any of the six
+  runs. (`ctest -R` with a prefix list matched only 64 of them, which is
+  why the binaries were run directly; the ctest subset also passed 64/64
+  in each tree.)
+- **`bench/smoke.sh build-sk 200000 7`:** PASS at 1/2/4/8 threads, 92,609
+  windows identical tumbling and 436,985 sliding in every run.
+- **`bench/crash.sh build-sk 50`** at 12:20 EDT (2M events seed 11, 4
+  threads, checkpoint every 100K events, throttle 400K events/s, SIGKILL
+  after 0.2 to 3.0 s, `--resume` until exit 0, `compare.sh` against the
+  oracle): **50/50 PASS, 392,549 windows identical in every trial, 149
+  kills in total, 47 of 50 trials killed at least twice, every trial
+  killed at least once (3 trials exactly once), at most 6 kills in one
+  trial (trial 26).** The finishing run of each trial resumed from epochs
+  10 through 20 of the 20, so the kills landed across the whole run. No
+  trial left a part file, a `.tmp` output or the checkpoint directory
+  behind. The run shared the machine with the other track's agent (load
+  average 4.7 to 7.7 over the run).
+- **Edge cases by hand**, `build-sk/bin/streamkit` on `gen --n 1000000
+  --seed 1`, exit codes captured under bash:
+  `cat ev.ads | streamkit --in - --ckpt-dir D` exits 1 with "needs a
+  seekable input file; stdin or a pipe cannot be rewound on resume";
+  `--out - --ckpt-dir D` exits 1 ("needs --out to be a file"); a run
+  SIGKILLed after 0.8 s exits 137 and leaves `MANIFEST` naming epoch 2
+  (`cat` shows the nine `key value` lines); the same command without
+  `--resume` exits 1 ("holds a previous run; pass --resume to continue it
+  or remove it"); `--resume` with `--lateness-s 30` or `--threads 2` exits
+  1 ("flags differ from the checkpoint's"); `--resume` with matching flags
+  exits 0, 205,806 windows identical to the oracle, checkpoint directory
+  and parts gone.
+- **ASan+UBSan (`build-sk-asan`)**: 1M events at 4 threads, `--lateness-s
+  60 --late-out`, checkpoint every 100K events, throttled to 150K
+  events/s, SIGKILLed every 3 s: 2 kills, final run resumed from epoch 8,
+  205,806 windows identical, 0 sanitizer lines.
+- **TSan (`build-sk-tsan`)**: same flags at 100K events/s, SIGKILLed every
+  4 s: 3 kills, resumed from epoch 8, 205,806 windows identical, 0 lines
+  matching `Sanitizer|ThreadSanitizer|runtime error|data race`.
+
+### Checkpoint cost at 100K open windows, re-measured
+
+Apple M5 Pro, 18 hardware threads, 24 GB, APFS on the internal SSD,
+Release `build-sk/bin/streamkit`, input `gen --n 1000000 --seed 1`, load
+average 5.6 to 5.7 (the other track's agent was building and testing the
+whole time, so wall times carry more noise than the per-snapshot timers,
+which clock only the worker's own checkpoint call). Three runs per row;
+the `checkpoints:` line of the stderr summary is the source.
+
+The plan's case, 1 thread, `--lateness-s 0`, `--checkpoint-every-events
+250000` (4 snapshots per run, 97,952 open windows and 595,368 dedup ids at
+the last one):
+
+| | snapshot bytes | slowest snapshot | all 4 snapshots | 4 manifests | wall |
+|---|---|---|---|---|---|
+| with fsync (default) | 9,072,065 | 34.8 / 37.6 / 40.1 ms | 126 / 126 / 137 ms | 14.7 / 14.7 / 14.4 ms | 0.33 / 0.35 / 0.39 s |
+| `--no-fsync` | 9,072,065 | 25.4 / 25.5 / 27.2 ms | 88 / 86 / 94 ms | 0.8 / 0.7 / 0.8 ms | 0.37 / 0.35 / 0.38 s |
+| no checkpoints | | | | | 0.29 / 0.30 / 0.31 s |
+
+So a 9.07 MB snapshot of 98K open windows costs 31 to 34 ms, of which 9 to
+11 ms is the three durable syncs and the rest serializing 98K windows and
+~600K ids plus the FNV pass. The byte count is identical to the two
+earlier measurements (44 bytes per window, 8 per id: deterministic). The
+wall-time columns overlap under this load and are reported for honesty,
+not as evidence; the per-snapshot timers are the number to quote.
+
+The harness setting (4 threads, `--lateness-s 60`, every 100K events, 10
+epochs, 40 snapshots per run): 16,615,820 bytes per epoch summed over the
+four workers (197,664 open windows summed), slowest single snapshot 55.7 /
+48.3 / 42.8 ms, 1.028 / 0.953 / 0.959 s of snapshot time per run (24 to
+26 ms per snapshot), wall 0.39 / 0.36 / 0.38 s against 0.13 / 0.13 / 0.13
+s without checkpoints. Same shape as this morning's numbers, a little
+slower on a busier machine.
+
+### A measurement dead end worth one paragraph
+
+The first attempt at the table above ran the flag variants from a zsh
+loop with the extra flags in an unquoted `$extra` variable. zsh does not
+word-split an unquoted variable, so `--ckpt-dir cost-ckpt
+--checkpoint-every-events 250000` reached the binary as a single
+argument, the arg parser saw an unknown flag with no value, and all three
+"modes" ran without any checkpoint at all, producing three identical
+columns of wall times and no `checkpoints:` line. The tell was the missing
+summary line, not the numbers. The loop was redone under `bash -c`, and
+the table reports only those runs. Lesson for the harnesses, which already
+follow it: `bench/*.sh` run under `#!/usr/bin/env bash`, never from an
+interactive zsh loop, and a measurement without its summary line is not a
+measurement.
+
+### Files touched this session
+
+`streamkit/README.md` (the m4 status line gains today's harness numbers),
+this file. No source file changed; the tree that passed is the tree that
+was handed over.
+
 ## 2026-10-21: m5, benchmarks and the emit-latency metric
 
 **Problem.** The plan's m5 is a table: throughput vs threads, p50/p99
@@ -1412,3 +1538,287 @@ identical; the same at 1M events under ASan+UBSan and TSan trees with 0
 reports (colstore's NOTES entry has the full table and the colstore-side
 costs). The run uses `--lateness-s 60` against a 30 s maximum lateness,
 so 0 events were late-dropped; the dedup count equals the oracle's.
+
+## 2026-10-21 (afternoon): m5 re-run on the finished tree, every number re-measured on a shared machine
+
+**What was asked, and what was already there.** The m5 brief: extend the
+harness with dedup, checkpoint and memory sections, add `--latency-stats`,
+write `BENCHMARKS.md`, rerun the regression, and record what I would
+change next. All of that had landed in the morning (the m5 entry above:
+`latency.h`, the five-section harness, the first `BENCHMARKS.md`). So this
+session is the one the plan's rule 2 exists for: rebuild everything from
+the sources, rerun every harness, and replace every number with one from
+a command run today, on a machine that turned out to be far from idle.
+No engine code changed.
+
+### Decision 1: `BENCHMARKS.md` holds this session's numbers only
+
+The alternative was to keep the morning's tables (taken at load 3.5 to
+4.5 with the other track building, quieter than most of today) and add
+today's as a second set. Rejected: a page that mixes two machine states
+invites quoting the better one without its caveat, and the brief's rule is
+that every number reported comes from a command run in the session that
+reports it. The morning's conclusions survive in the m5 entry above, and
+today reproduced the ones that matter (below). Cost: the morning's full
+decomposition table (five campaign counts, seven thread counts) is no
+longer on the page; today's page has the three points that carry the
+argument.
+
+### The emit-latency metric, restated so it cannot be misread
+
+For every window that a worker's watermark closes, the sample is
+`t_row - t_block`: `t_block` is `steady_clock` read by the reader thread
+right after `read(2)` returned the block of input bytes holding the event
+that pushed that worker's watermark past the window's end; `t_row` is
+`steady_clock` read by the worker right after `fprintf` appended that
+window's row to its output stream. p50 and p99 are nearest-rank
+percentiles over all such samples in a run (always a value that was
+observed). It is the time from "this process could first have known the
+window was closable" to "the row exists". It excludes: the configured
+lateness (event time, by design); the producer's buffering before the
+bytes reach the pipe (gen holds 1 MiB, so at 200K events/s the pipe
+delivers ~1 MB bursts every ~100 ms); the stdio flush of the row to disk,
+any fsync, and the final merge; and windows closed by end of input. Rows
+are stamped one by one, so a row behind others in the same closing call is
+charged for them, which is deliberate. Off by default; with the flag off
+no clock is read and nothing is stored (`Latency.OffByDefaultRecordsNothing`).
+The reasons for each choice are in the m5 entry above; the arithmetic is
+`latency.h`.
+
+### Decision 2: the harness checks both exit statuses of the paced pipeline
+
+The first full harness run of the session died in the latency section
+with exit 141 (SIGPIPE) after the second 8-thread run, and its `trap` had
+already deleted streamkit's stderr. Eight reruns of the same `gen | sk`
+pipeline by hand (20 s and 5 s) with both statuses captured never failed,
+and the `sed | head -1` helpers were checked (2,000 iterations, 0
+failures), so the cause is unknown. Rather than guess, `lat_run` in
+`bench/throughput.sh` now runs the pipeline with `set +e`, reads
+`PIPESTATUS` for gen and streamkit separately, prints both statuses and
+both stderr logs if either is non-zero, and retries once. Alternatives:
+ignore gen's status (a streamkit crash would then look like a clean run
+with no rows: hidden); keep aborting (loses the rest of a four-minute run
+and the evidence, which is what just happened). Cost: 20 lines of bash
+and one extra log file. Four harness runs went through the edited script,
+two of them through `lat_run`, without a failure.
+
+### What the numbers say today, and what they do not
+
+Everything is in `BENCHMARKS.md`, with the run-to-run spread; the parts
+that needed reading:
+
+- **The machine.** `build-cs/bin/colstore_sqlite` (the other track's
+  benchmark) sat at 100% of a core until about 13:00 and `fseventsd` at
+  85 to 90% for the whole session, checked with `ps` before each run. A
+  background poll waited 14 minutes for the benchmark to stop and the load
+  to fall below 3, then ran harness E at 13:13; the neighbour's activity
+  came back intermittently afterwards. Load average at the start of a run
+  was a poor guide (the run that started at 3.77 was the slowest). A
+  single thread's throughput moved from 4.58M to 2.63M events/s between
+  runs twenty minutes apart on the same binary and input, which CPU
+  contention on 18 cores cannot explain; what moved is the memory system
+  and the SSD, i.e. exactly what the dedup insert and the checkpoint
+  fsyncs depend on.
+- **Throughput: 4.97M / 9.36M / 18.7M / 28.0M events/s at 1 / 2 / 4 / 8
+  threads (5.63x), run E,** with the three runs per cell within 2% at 1
+  and 8 threads. The shape was the same in all four runs (1.83 to 1.93x
+  at 2 threads, 2.8 to 3.8x at 4, 4.5 to 5.6x at 8, reader stalls falling
+  from ~72K to ~2K and idle waits rising, so the workers remain the
+  bottleneck up to 8 threads) while the level in runs A, C and D was 0.5
+  to 0.9x of E's.
+- **Dedup costs 51 ns per event, the same on clean and dirty streams**
+  (run F: 1/5,035,224 - 1/6,778,647 = 51.1 ns dirty, 52.4 ns clean, 25.7%
+  and 26.1% of a single thread), the morning's number reproduced to the
+  nanosecond. It took six attempts to get one dedup table whose 1-thread
+  cells agreed within 2%: the four earlier runs gave per-event differences
+  of -71 to 263 ns, including run E's three identical runs at 4.66M,
+  3.11M and 1.37M events/s seconds apart. A cache-missing hash insert per
+  event is the operation most sensitive to a neighbour thrashing memory,
+  so it is the first cell to go and the last to come back.
+- **Checkpoints: the per-snapshot cost is the stable number.** Total
+  snapshot time / 80 = 30.2, 33.4, 39.6 and 38.9 ms per snapshot across
+  the four runs (slowest single snapshot 44 to 69 ms), and 10 epochs x
+  that matches the wall-time increase (0.20 to 0.34 s) to within the
+  overlap the reader gets by filling the queues while workers snapshot.
+  The "vs none" percentages (-22% to -32%) measure the neighbour as much
+  as the checkpoints: in run E the identical no-checkpoint command gave
+  28.0M in the threads section and 14.2M two minutes later as the
+  checkpoint baseline. At the generator's native rate the snapshot is a
+  30 to 40 ms stall every 100 s, 0.03 to 0.04%.
+- **Memory: identical to the morning within 1%.** 92.5 / 103.2 MiB at 1M
+  / 10M events on one thread (11.5% for 10x the events, dedup set 0.99M
+  to 1.19M ids, open windows ~200K in both); 87 / 119 MiB at 8 threads
+  with `--queue-depth 256`; 130 / 346 MiB with the default 4096-slot
+  queues once the reader has touched all 27 MB per worker. RSS does not
+  care about the neighbour, which is why this section needed only one run.
+- **Emit latency: p50 7.9 ms, p99 16.1 ms at 8 threads; p50 14.4 ms, p99
+  25.5 ms at 1 thread (run E)**, on top of the 2 s lateness, at 200K
+  events/s with 86K windows closing per second. Across the thirteen 20 s
+  8-thread runs of the session the p50 stayed between 7.5 and 12.0 ms (two
+  p99 outliers at 30 and 48 ms in the noisiest minutes), while the
+  1-thread cells moved with the machine as the throughput cells did (p50
+  14 ms in A and E, 28 ms in D): with eight workers each one's share of a
+  20K-event burst is 2.5K events, so most of a sample is the producer's
+  100 ms burst pattern plus the rows written before it, neither of which
+  is CPU time; with one worker the whole burst is CPU time and the
+  neighbour shows.
+- **The decomposition reproduced.** 1K campaigns (so almost no rows) give
+  a p99 of 4.6 ms at 1 thread and 1.7 ms at 8: the floor is the closing
+  event waiting behind its own burst. Above the floor, (p99 - floor) /
+  rows per worker per boundary is **0.24 us per row with one worker
+  writing, 0.44 with four, 1.34 with eight** (morning: 0.24 / 0.33 / 1.0
+  to 1.1), so the per-row cost that grows with concurrently emitting
+  workers is real and the 4-thread point (p99 11.2 ms) is again the best
+  for this workload. The culprit is still one of `fprintf`'s FILE lock
+  plus formatter and `std::map::erase`'s allocator free; item 2 below.
+
+### A measurement lesson, recorded so the next harness does better
+
+Wall-clock events/s is the right headline for an idle machine and the
+wrong instrument for a shared one: it cannot tell the engine from its
+neighbour, and it took six harness runs over fifty minutes to get one
+clean dedup table. Two things would have made the first run's dedup and
+threads tables meaningful anyway. First, report CPU time per run
+(`ru_utime + ru_stime` from `getrusage`, or `/usr/bin/time -l`'s user and
+sys lines, which the memory section already captures): a neighbour
+inflates wall time much more than it inflates the engine's own CPU
+seconds, and the dedup cost per event is a CPU-time question. Second,
+print the run-to-run spread as a number next to the median and refuse to
+bold a cell whose spread exceeds, say, 15%, so the table itself says
+which numbers are usable. Both are harness changes, not engine changes,
+and are the first item below.
+
+### What it costs
+
+Nothing in the engine (no source under `streamkit/` changed other than
+documentation). The harness: one helper, two extra words in the trap, one
+extra log file, and about 4 minutes for all five sections.
+
+### How it was verified
+
+- Warnings: every source this track owns touched, then
+  `cmake --build <dir> --target streamkit streamkit_tests adstack_tests
+  oracle gen evdump` in `build-sk`, `build-sk-asan`, `build-sk-tsan`: 16
+  translation units per tree, 0 warnings, 0 errors (12:30 EDT).
+- Tests: `adstack_tests` + `streamkit_tests` run directly in each of the
+  three trees: 16 + 63 = 79 passed, 0 sanitizer lines; `ctest -R` over
+  this track's suites: 100% of 79 in each tree.
+- `bench/smoke.sh build-sk`: PASS at 1/2/4/8 threads, tumbling (92,609
+  windows identical) and sliding (436,985), 1,951 dups equal to the
+  oracle's, 0 late (12:44).
+- `bench/crash.sh build-sk 50`: 50/50 PASS, 392,549 windows identical in
+  every trial, 138 kills, 47 trials killed at least twice (3 once, 21
+  twice, 16 three times, 6 four, 3 five, 1 six), no leftovers (12:44 to
+  12:50).
+- ASan+UBSan and TSan on the paced latency path (500K events at 100K
+  events/s, 4 and 8 threads, `--latency-stats --late-out`): exit 0 for
+  gen and streamkit, zero sanitizer lines, 310,446 windows written and
+  131,486 sampled in each of the four runs (12:51).
+- `bench/throughput.sh build-sk`: six runs (A 12:31 all sections, B 12:37
+  latency, C 12:42 threads/dedup/checkpoint, D 12:54 all but memory, E
+  13:13 all but memory, F 13:17 dedup), plus three 10 s decomposition runs
+  at 13:18; the edited harness syntax-checked (`bash -n`) and run end to
+  end four times after the edit (twice through `lat_run`).
+
+### What I would change next
+
+1. **Make the harness measure CPU time and print the spread** (the
+   lesson above). `ru_utime + ru_stime` per run from the engine's own
+   summary (one `getrusage` call at exit), a "spread" column = (max -
+   min) / median, and no bold median when the spread passes 15%. Then the
+   dedup cost in nanoseconds per event is `(cpu_on - cpu_off) / events`,
+   a quantity a neighbour barely touches, and the threads table says
+   outright which cells to trust. A few lines in `main.cpp` and the
+   harness; the acceptance test is rerunning today's dedup section with
+   the neighbour running and getting three runs that agree.
+2. **Format rows without libc `printf`, and erase closed windows in
+   bulk.** Today's decomposition put the per-row cost at 0.24 us with one
+   worker writing, 0.44 with four and 1.34 with eight (p99 25.5 / 11.2 /
+   16.1 ms), the same contention the morning found. A hand-rolled
+   unsigned-to-ASCII into a worker-owned buffer flushed with `write(2)`
+   removes the FILE lock and the formatter; `open_.erase(begin, it)` after
+   the loop replaces one allocator free per row with a batch. The target
+   is the 1-worker per-row cost at 8 workers, which would take the p99 at
+   this workload from 16 ms to about 4 ms and restore the expectation that
+   more workers means lower emit latency. The first run tells which of the
+   two was the culprit.
+3. **A replayable-log source (Kafka) with offset commit tied to the
+   checkpoint epoch.** The MANIFEST already records "input offset X"; for
+   a partitioned log it records partition -> offset, captured by the
+   reader when it injects the marker, and the consumer group's offsets are
+   committed only after the MANIFEST rename, never before. A crash between
+   snapshot and commit then replays from the last committed offsets into
+   the same truncate-and-replay that resume already does, so the pipeline
+   is exactly-once end to end without idempotent sinks. It needs one
+   marker per source partition and new partition assignments held until
+   the epoch boundary. This is the change that turns the engine from a
+   file tool into a service.
+4. **Incremental snapshots.** Today a snapshot is ~2.3 MB per worker and
+   30 to 40 ms, half of it dedup ids that barely change between epochs
+   (one bucket appended, one expired) and open windows that change mostly
+   at the front. A base snapshot plus per-epoch deltas (new buckets, count
+   of expired buckets, windows touched since the last epoch, part-file
+   lengths), compacted into a new base every k epochs, cuts bytes per
+   epoch by roughly horizon / interval. Cost: a chain to validate on
+   resume (each delta hashed and bound to its predecessor) and resume time
+   that grows with k. Not worth it at today's size; the right design once
+   open state is a hundred times larger (long windows, many keys).
+5. **Watermark alignment across partitions for ordered output.** Each
+   worker publishes its watermark through one atomic; a merger pulls
+   closed rows from P per-worker queues and emits them in window-start
+   order up to the minimum watermark. Output becomes globally time-ordered
+   (colstore could ingest it pre-sorted and prune by zone map without a
+   sort) and the merger is the natural place to move the checkpoint fsync
+   off the workers. Cost: the slowest partition holds every partition's
+   rows back, so emit latency becomes the max over partitions, the trade
+   the m3 entry chose against for the per-worker watermark. Behind a flag.
+6. **Make `gen --pace` flush on every sleep** (`tools/gen.cpp`, root-owned,
+   so not changed here). The 1 MiB write buffer turns a paced stream into
+   100 ms bursts and puts a 1.7 to 4.6 ms floor under every latency
+   sample; with per-sleep flushes the pipe would carry events as produced
+   and the measurement would show the queue handoff itself.
+
+### Files touched this session
+
+`bench/throughput.sh` (`lat_run`, trap), `streamkit/BENCHMARKS.md`
+(rewritten from this session's runs), `streamkit/README.md` (status,
+harness note), this file. No engine source changed.
+
+## 2026-10-21 13:50 EDT: integration with colstore re-verified from the current tree (no code change)
+
+The integration (`bench/e2e.sh`, colstore's `ingest --in-csv` over this
+engine's CSV, the entry above on why the boundary is CSV) was already
+committed in `0dff510`; this session re-ran it from fresh configures of
+`build-int`, `build-int-asan` and `build-int-tsan` and changed nothing in
+`streamkit/` but this entry and one README clause. The full table and the
+commands are in `colstore/NOTES.md` (same timestamp); the streamkit-side
+facts:
+
+- 5M dirty events at 4 threads with checkpoints every 1M: 49,791 dups
+  (equal to the oracle), 0 late-dropped (`--lateness-s 60` against a 30 s
+  maximum), 3,735,840 windows, 5 epochs committed at offset 260,000,008,
+  0.79 s engine time (6.36M events/s) at load 4.9; `compare.sh` PASS,
+  3,735,840 windows identical. Two Release runs, both PASS with the same
+  counts; only wall-clock differed with the load (10.3 vs 4.9).
+- 1M events through the ASan+UBSan and TSan trees, concurrently, with the
+  sanitizers' `log_path` pointed outside the harness's work dir: E2E PASS,
+  exit 0, no report file written by either.
+- Exit on mismatch re-proved with a wrapper `oracle` that adds 1 to one
+  row's cost: `compare` FAIL, `E2E FAIL`, exit 1.
+
+**The boundary, restated from this side.** The CSV stays because it is
+the format the checkpoint protocol already relies on (an append-only byte
+stream whose length is the state: the snapshot records the output length
+and `--resume` truncates to it), because `compare.sh` already proves it
+against the oracle so the integration added no new way for the two
+engines to disagree, and because at this scale it is not where the time
+goes (colstore parses the 127 MB in 0.68 s; `compare.sh` spends 14 s
+sorting the same rows). A fixed-width binary record would turn six
+`from_chars` per row into a `memcpy` and save almost no bytes; an
+Arrow-style stream would also carry the column names and types with the
+data (today they are a convention held in `write_csv_header` here and
+`aggregate_schema()` there) and would let colstore ingest record batches
+as windows close rather than after the file is complete. The cost of
+either is a third format plus a block-aware resume rule, which nothing
+needs until an ingest must keep up with streamkit live or a column is
+added on one side only.

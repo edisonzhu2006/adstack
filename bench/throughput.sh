@@ -51,7 +51,7 @@ IN_1M="$CACHE/ev1000000_seed${SEED}.ads"
 OUT="$CACHE/throughput_out.csv"
 CKPT="$CACHE/throughput_ckpt"
 LOG="$CACHE/throughput_run.log"
-trap 'rm -f "$OUT" "$OUT".part* "$OUT.tmp" "$LOG"; rm -rf "$CKPT"' EXIT
+trap 'rm -f "$OUT" "$OUT".part* "$OUT.tmp" "$LOG" "$LOG.gen"; rm -rf "$CKPT"' EXIT
 
 want() { case ",$ONLY," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
@@ -68,6 +68,29 @@ field()  { sed -n "s/.*$1 \([0-9.]*\).*/\1/p" "$LOG" | head -1; }   # field "pea
 
 # Median of three numbers = the middle one after a numeric sort.
 median3() { printf '%s\n' "$1" "$2" "$3" | sort -n | sed -n 2p; }
+
+# One paced run for the latency section: gen --pace piped into streamkit,
+# summary left in $LOG. Both exit statuses are checked, not just the
+# pipeline's: gen dying of SIGPIPE (141) would mean streamkit closed the pipe
+# early, and a run like that is not a sample. One full harness run was lost
+# that way (2026-10-21, exit 141 with the log already deleted), so now a
+# failed run prints both statuses and streamkit's stderr and is retried once
+# instead of taking the whole harness down.
+lat_run() {  # $1 = threads
+  local attempt st
+  for attempt in 1 2; do
+    set +e
+    "$B/bin/gen" --n $((LAT_RATE * LAT_SECS)) --rate "$LAT_RATE" --pace --seed "$SEED" --out - 2>"$LOG.gen" \
+      | sk --in - --out "$OUT" --window-s 1 --lateness-s 2 --threads "$1" --latency-stats
+    st=("${PIPESTATUS[@]}")
+    set -e
+    if [ "${st[0]}" -eq 0 ] && [ "${st[1]}" -eq 0 ]; then return 0; fi
+    echo "latency run (threads $1, attempt $attempt) failed: gen exit ${st[0]}, streamkit exit ${st[1]}" >&2
+    echo "--- gen stderr ---" >&2; cat "$LOG.gen" >&2
+    echo "--- streamkit stderr ---" >&2; cat "$LOG" >&2
+  done
+  return 1
+}
 
 # Percentage change of $1 relative to $2, as "+x.x%" (positive = $1 is larger).
 pct() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%+.1f%%", (a - b) * 100.0 / b }'; }
@@ -241,8 +264,7 @@ if want latency; then
   for P in 1 8; do
     p50s=(); p99s=()
     for run in 1 2 3; do
-      "$B/bin/gen" --n $((LAT_RATE * LAT_SECS)) --rate "$LAT_RATE" --pace --seed "$SEED" --out - 2>/dev/null \
-        | sk --in - --out "$OUT" --window-s 1 --lateness-s 2 --threads "$P" --latency-stats
+      lat_run "$P"
       line=$(grep 'emit latency over' "$LOG")
       wins=$(echo "$line" | sed -n 's/.*over \([0-9]*\) watermark.*/\1/p')
       mn=$(echo "$line"   | sed -n 's/.*min \([0-9]*\) us.*/\1/p')

@@ -1372,3 +1372,429 @@ confirmed (`compare` FAIL, the awk check FAIL, `E2E FAIL`, exit 1).
 5. *The 10 s `compare.sh`* is now the slowest step of a pipeline whose
    engines take 0.8 s each; it sorts 3.7M rows twice through `sort(1)`.
    The oracle could write in sorted order and a `cmp` would do.
+
+## 2026-10-21 12:19 EDT: m3 re-verified a second time from the current tree (no code change)
+
+The workflow handed over "colstore m3, current state m1-m2 done" once
+more. The tree is through m5 and the integration, and the m3 entry
+above plus the first re-verification of today already cover the design.
+Two ways to respond: rebuild m3 to match the stale brief, which would
+discard verified code that m4's `Scanner` consumers and m5's benchmark
+sit on, or report done without running anything, which would put numbers
+in this file from memory. Neither is acceptable, so this session re-ran
+m3's "done when" from the tree as it stands, in `build-cs`,
+`build-cs-asan` and `build-cs-tsan`, and changed no source. Cost: about
+fifteen minutes of machine time and a 160 MB temporary `.col` that is
+deleted at the end. This entry is deliberately short; it records what
+moved and what did not.
+
+**Build and tests.** Release: `ninja -t clean` then a full rebuild, 69
+steps, one warning in the whole tree and it is GoogleTest's own
+`gtest-printers.h:524` (`-Wcharacter-conversion` with clang 21), zero in
+`colstore/`. ASan+UBSan and TSan trees: zero warnings. `ctest` 207 / 207
+in Release and under ASan (129 entries match the colstore pattern, 29 of
+them the m3 suites `Predicate`, `ZoneMap`, `WhereParser`, `Exec`,
+`Selector`); `colstore_tests` under TSan 128 / 128.
+
+**Correctness.** `verify --where` on the four bench predicates against
+the brute-force loop over the `.ads` file: PASS, rows 599,888 / 180,421 /
+899,878 / 10,284, `sum(cost_micros)` 58,139,739,009 / 17,322,428,194 /
+944,501,914,095 / 959,460,377, every figure identical to the 19th and to
+this morning. Zone maps: 10 s / 60 s / 300 s ranges skip 146 / 138 / 101
+of 153 groups (7 / 15 / 52 scanned); the unsorted `campaign_id` range
+skips 0. The README's `--limit 10` example under ASan stops after one
+group, 45 groups skipped before it, 126 rows passed of the 52,224
+decoded, and exits 0; ASan `verify --where` on P3 PASS. TSan: a 4-thread
+`q` over the one-hour range on the 10M file (45 of 153 skipped, 6,990,857
+rows, 0.739 s) with no report.
+
+**Times (3 runs, `--count`, load average 8 from the streamkit track).**
+P1 0.006-0.008 s, P2 0.009-0.012, P3 0.064-0.081, P4 0.043-0.044,
+decode-only two columns 0.038-0.041. Batch sweep on P3: 1 row 0.187-0.189,
+128 0.066, 1024 0.065-0.068, 65,536 0.065. The batched numbers are within
+5% of both earlier runs; the one that moved is `--vector 1`, 0.137 on the
+19th and 0.140 this morning at load 4-5, 0.188 now at load 8. So the
+row-at-a-time penalty quoted in the m3 entry (2.2x) is the conservative
+end; under contention it is 2.9x, which only strengthens the batching
+argument, and I am not claiming the larger figure because the load was
+not controlled.
+
+**What a reviewer should take from this entry.** Three runs on three
+occasions, same counts to the row and the micro-dollar; the pruning
+headline ("60 s range skips 138 of 153 groups") is a property of the file
+and the predicate, not of the machine's mood, and only wall-clock times
+move, by single-digit percent for batched scans.
+
+## 2026-10-21 12:32 EDT: m4 re-verified a second time from the current tree (no code change)
+
+The workflow handed over "colstore m4, current state m1-m3 done" once
+more, the same way it re-sent m2 and m3 today. The tree is through m5
+and the integration, and the m4 entry of the 19th plus this morning's
+first re-verification already cover every design decision and the one
+real bug found (the test-helper temp-file collision). As in the m3 entry
+above, rebuilding m4 to match a stale brief or reporting done from memory
+were both ruled out; this session re-ran m4's "done when" from the tree
+as it stands, in `build-cs`, `build-cs-asan` and `build-cs-tsan`, and
+changed no source. Cost: about twenty minutes of machine time and a
+160 MB temporary `.col` that is deleted at the end. Logs:
+`/private/tmp/adstack-cs/bench_m4_reverify2_2026-10-21.txt` (the full
+`bench/colstore_bench.sh build-cs 10000000` run) and
+`sanitizers_m4_reverify2_2026-10-21.txt.{asan,tsan}` next to it.
+
+**Item-by-item against the brief, one line each.** GROUP BY on one or
+more integer columns with `count / sum / min / max`: `HashAggregate`
+(`aggregate.h`), keys packed to 128 bits by `KeyPacker`, wider keys
+refused at plan time. Own open-addressing table with probing and growth
+commented: `hash_table.h` (linear probing, power-of-two capacity, double
+at half load, splitmix64 mixer, and why each). Selection vectors from
+Filter: `consume()` walks `b.row(k)`. Sort / limit with a heap when N is
+small and why: `sort.h`, `std::partial_sort`. CLI `q --in --where --group
+--agg --order --limit --stats`, CSV on stdout: `cmd_q` in `main.cpp`
+(`--threads`, `--vector`, `--check`, `--check-csv` on top). Q1 / Q2 / Q3
+with SQL: README "Benchmark queries (m4)". Brute-force check from the
+`.ads` file: `q --check`, `std::map` plus `std::stable_sort`, no code
+shared with the engine, and `QueryFiles.CheckDetectsAWrongResult` proves
+it can fail. Times on 10M, median of 3, cold vs warm stated: the script,
+cold still "not measured" (`sudo -n true`: a password is required).
+Multithreaded scan, row-group-interleaved, per-thread tables merged at
+the end, TSan clean: `run_aggregate_query` in `query.cpp`. So the brief's
+"if you skip threads, say so first under what I would change" does not
+apply; the first thing I would change is still the serial merge (tree
+merge, then hash-partitioned groups), as the m4 entry says. Tests for
+growth and collisions (`GroupTable.*`, 7), aggregates on constructed data
+(`HashAggregate.*`, 8, plus `KeyPacker.*` 5 and `AggParser.*` 4), ORDER
+BY / LIMIT (`SortLimit.*` 4, `OrderParser.*` 1), end to end
+(`QueryFiles.*` 10): 39 m4 tests, the same count as on the 19th.
+
+**Build and tests.** `ninja -t clean` then a full rebuild: Release 69
+steps, ASan+UBSan 69 steps, TSan colstore targets 40 steps; one warning
+per tree and it is GoogleTest's own `gtest-printers.h:524`
+(`-Wcharacter-conversion` under clang 21), zero in `colstore/`. `ctest
+-j 8`: 207 / 207 in Release and ASan (103 entries match the colstore
+pattern, 39 of them the m4 suites). TSan: `colstore_tests` 128 / 128
+directly and under ctest; that tree's ctest total reads "2 tests failed
+out of 130" and both are `adstack_tests_NOT_BUILT` and
+`streamkit_tests_NOT_BUILT`, the placeholders `gtest_discover_tests`
+registers for binaries that were never built there (only the colstore
+targets were, as in the first m4 re-verification). Recorded so the line
+is not read as a colstore failure; 128 + 2 = 130.
+
+**Correctness, identical to the 19th and to this morning.** Release
+(script): Q1 / Q2 / Q3 `--check` PASS at one thread, Q2 / Q3 top-20 at 8
+threads PASS with the 20 ordered rows identical. Q1 = 269,609. Q2: 45 of
+153 row groups skipped, 6,990,857 rows in 6,837 batches, 100,000 groups
+in 262,144 slots after 8 doublings, 1.32 probes per row. Q3: 9,766
+batches, same table, same probes. Two-column `GROUP BY campaign_id,
+country`: 991,852 groups in 2,097,152 slots, 11 doublings, 1.34 probes
+per row. SQLite answers identical to colstore's for all three (1 /
+100,000 / 100,000 rows).
+
+**Times: the script's m4 stage ran 2x slow, and the same log says why.**
+During the m4 stage the load average was 4.9-6.9 with `fseventsd` at 89%
+CPU (the other track was writing heavily), and the stage measured Q1 /
+Q2 / Q3 at 0.100 / 0.186 / 0.406 s on one thread and 0.017 / 0.109 /
+0.181 s on eight. Everything else in the same log moved by the same
+factor: the m3 full-scan predicate 0.109 s (0.067 this morning), the
+three-column decode-only 0.099 s (0.060), auto ingest 2.0-3.0 s
+(1.2-1.3). Four minutes later, at load 3.3, a fresh ingest (1.203 s) and
+a re-time of the same queries inline (median of 3, same `--stats`
+total): one thread 0.050 / 0.093 / 0.176 s, two 0.027 / 0.056 / 0.110,
+four 0.014 / 0.043 / 0.082, eight 0.008 / 0.038 / 0.065, i.e. every
+cell within 5% of the 19th's table (0.051 / 0.092 / 0.177 down to 0.008
+/ 0.040 / 0.068). The m5 stage of the script run, which started after
+the load had dropped, shows the recovery inside the same log: colstore
+0.074 / 0.108 / 0.246 s at one thread and Q2 41.2x, Q3 26.3x faster than
+SQLite's best plan (42.6x / 28.0x on the 19th). Sort on the 100K-row Q3
+result: full 7.1-7.4 ms, `LIMIT 20` 0.2 ms, `LIMIT 1000` 0.5-0.6 ms,
+unchanged. At 8 threads Q3's merge is 9.2 ms (8.4 on the 19th) with 1.43
+probes per row summed over the eight tables and the merge. The README's
+table stays as it is because the re-time reproduces it; the lesson is
+written here instead: median-of-3 protects against one bad run, not
+against a load that outlasts the three, and what caught it was a control
+in the same log (the m3 scans and the decode-only time) that moved with
+it. The batch-size sweep in the loaded stage (1024 / 8192 / 65536 at
+0.365 / 0.436 / 0.481 s, single runs 0.359-0.498) looks like the m3
+hypothesis coming back, but the two earlier runs at normal load showed a
+2% spread and this one was not at normal load, so it is a reason to
+re-measure under a controlled load, not a finding.
+
+**Sanitizers on the 10M file, zero reports.** ASan+UBSan: Q1 / Q2 / Q3
+`--check` PASS (engine 0.188 / 0.341 / 0.669 s), Q2 / Q3 top-20 at 8
+threads PASS (0.125 / 0.225 s), and the two-column query with `count(),
+min(cost_micros), max(cost_micros)` at 4 threads clean (0.862 s; 44
+doublings summed over four tables and the merge, 1.74 probes per row).
+TSan: Q2 / Q3 top-20 at 8 threads `--check` PASS (engine 0.586 / 1.049
+s, brute force 17.3 / 39.0 s under TSan), Q3 at 16 threads 1.685 s (the
+merge alone is 1.0 s under TSan, 128 doublings summed), the two-column
+query at 8 threads 5.44 s. Sanitizer times are not performance numbers.
+
+**What a reviewer should take from this entry.** Three occasions, three
+clean rebuilds, every count identical to the row and the micro-dollar;
+wall-clock is the only thing that moves, and when it moved by 2x the
+same log carried the reason. The two items left alone this morning
+(`effective_order`'s unused `schema` parameter, `columns_needed()`
+rebuilt per batch) are still as described and still left alone.
+
+## 2026-10-21 13:35 EDT: m5 re-verified from the current tree (no code change)
+
+The workflow handed over "colstore m5, current state m1-m4 done", as it
+re-sent m2, m3 and m4 earlier today. The tree already holds m5 (the
+`colstore_sqlite` loader, the `m5` stage of `bench/colstore_bench.sh`,
+BENCHMARKS.md) and the integration work after it, and the m5 entry above
+covers the design decisions. Rebuilding m5 to match a stale brief or
+reporting done from memory were both ruled out, as before. What this
+session did: a clean rebuild of `build-cs`, `build-cs-asan` and
+`build-cs-tsan` from the current tree, the full test suites, the
+sanitizer runs on the 10M file, seven runs of the m5 stage, and a rewrite
+of BENCHMARKS.md so that every number in it comes from this session, as
+the brief requires. No source file changed. Cost: about an hour of
+machine time, most of it waiting for the machine to go quiet, and the
+usual 160 MB `.col` and 900 MB `.sqlite` temporaries, deleted by the
+script. Logs: `/private/tmp/adstack-cs/bench_m5_reverify{,2,3,4,5,6,7}_2026-10-21.txt`,
+`sanitizers_m5_reverify_2026-10-21.txt.{asan,tsan}`,
+`release_checks_m5_reverify_2026-10-21.txt`, `m5rv_build_*.log`,
+`m5rv_ctest_*.log`.
+
+**Build and tests.** `ninja -t clean` then a full rebuild in each tree:
+Release 69 steps, ASan+UBSan 69 steps, TSan colstore targets 40 steps.
+One warning per tree, GoogleTest's own `gtest-printers.h:524`
+(`-Wcharacter-conversion` under clang 21), zero warnings in `colstore/`
+(`grep warning: | grep -c colstore/` = 0 across the three logs). cmake
+found sqlite3 in the SDK (`libsqlite3.tbd`) and built `colstore_sqlite`
+and the loader tests in all three trees. `ctest -j 8`: 207 / 207 in
+Release (1.95 s) and under ASan (3.40 s, no sanitizer output); 9
+`SqliteLoader.*` tests among the 128 in `colstore_tests`, which also ran
+128 / 128 directly under TSan.
+
+**Correctness, identical to the 19th and to the first m5 run.** Release:
+`verify` PASS on the 10M file (0.494 s); Q1 / Q2 / Q3 `--check` PASS
+(engine 0.050 / 0.093 / 0.176 s against the `std::map` brute force);
+Q3 top-20 at 8 threads PASS, 20 ordered rows identical; Q2's zone map
+153 total, 45 skipped, 108 scanned. ASan+UBSan: `verify` PASS (3.32 s),
+Q1 / Q2 `--check` PASS (engine 0.417 / 1.298 s), Q3 top-20 at 8 threads
+PASS (0.340 s); on a 1M-row file the loader built the three indexes and
+`sqlite_stat1`, and Q1 / Q2 / Q3 from both engines diffed identical
+(1 / 0 / 99,993 rows; Q2 is empty on 1M rows because the file spans 100 s
+and `T0` is at 300 s, the same non-vacuous zero as before). TSan: Q3 at
+8 threads on 10M (3.08 s, 64 doublings and 1.43 probes per row summed
+over the eight tables and the merge, the same figures as m4's
+re-verification), Q2 top-20 at 8 threads `--check` PASS, the 1M loader
+plus an 8-thread Q3 diffed against SQLite's answer (identical). Zero
+reports from either sanitizer. The one hiccup was mine: the TSan tree has
+only the colstore targets, so its first 1M section failed for want of
+`gen` and was redone with `build-cs/bin/gen`; the log keeps both.
+
+**Numbers: run 7 reproduces the first write-up cell for cell.** SQLite
+load 15.223 s (2.781 insert + 11.870 indexes + 0.552 ANALYZE) against
+16.529 s then; colstore ingest 1.215 s against 1.313. Q1 0.0028 s
+covering index against 0.063 s (22.5x to SQLite; 0.055 s and 19.6x
+then). Q2 4.1553 s best plan (`NOT INDEXED`, the planner's index plan
+5.1766 s) against 0.098 s: 42.4x (42.6x then). Q3 5.4385 s best plan
+(index-ordered scan; `NOT INDEXED` 6.8925 s) against 0.181 s: 30.0x
+(28.0x then). Eight threads 0.009 / 0.040 / 0.068 s. Storage
+520,000,008 / 160,201,178 / 488,329,216 / 899,682,304 bytes; the `.col`
+is 181 bytes larger than in the first write-up and that is the format
+version 2 schema in the footer (integration entry), column data
+byte-identical. The plans are unchanged, and `dbstat` gives the same
+four object sizes to the byte.
+
+**What the seven runs taught, and the decision they forced.** The first
+run started at load 15.75 with the streamkit track's crash harness and
+`fseventsd` (84-89% of a core all day) on the machine; runs 2-4 overlapped
+its throughput harness; run 5, taken after that agent's shell exited,
+still had `systemstats` pinning a core; runs 6 and 7 started with a Chrome
+helper at 40-54%. Counts, sizes, plans, the 45-of-153 skip and the
+cross-engine diff were identical seven times; the medians moved, and the
+two engines did not move together: Q2's ratio ran from 22.7x to 50.1x,
+Q3's from 8.7x to 30.4x. Three ways to turn that into one table: the
+median of the seven medians (a number from a machine state nobody can
+reproduce, mixing loaded and quiet runs), the best cell from any run (a
+table no single command produced, which breaks the "reproducible by one
+script" rule), or one complete run chosen by controls inside the log.
+The third is what BENCHMARKS.md does: colstore ingest and SQLite's index
+build are measured in every run and have quiet values (1.21-1.23 s and
+11.9 s) that they only reach when nothing else is running; run 7 is the
+only run where both sat at those values from start to finish, so its
+table is the headline and the other six are printed under it in full.
+Two smaller lessons. The one-minute load average is a poor gate on this
+machine: runs 4 and 5 started at 3.3-3.4 and were the slowest, because a
+single-threaded daemon at 100% barely moves an 18-core load average and
+still costs a benchmark a core's worth of shared cache and memory
+bandwidth. And the other track's agent was polling for `colstore_sqlite`
+to be absent before starting its harness while I was polling for its
+harness to be absent; with both loops gated on the other, I waited for
+its shell to exit outright (12 minutes) rather than for a load threshold
+neither of us would see. A harness that does not know the machine is
+shared cannot defend its own numbers; that is the first item below.
+
+**The resume line this supports, unchanged in substance.** "3.25x
+smaller than the raw input and 30x to 42x faster than SQLite's best plan
+on GROUP BY over 10M ad events, single-threaded; 80x to 104x on 8
+threads; 22x slower than a covering index on an equality count." The
+last clause stays in because the table says so.
+
+**What I would change next, in the order I would do it.** The m5 entry
+above lists six design changes (small-domain bitmaps for Q1,
+hash-partitioned parallel aggregation, LZ4/zstd per chunk with a cold
+measurement, statistics-based encoding choice, late materialization, a
+SQL frontend) and they stand. This session adds the following, each
+with the reason it earned its place today.
+
+1. *A load-aware harness, before any more numbers.* Each stage of
+   `bench/colstore_bench.sh` would first run a fixed calibration (the
+   10M auto ingest is a good one: single-threaded, CPU-bound, 1.2 s on a
+   quiet machine, and already measured) and refuse to time anything
+   while it is more than 10% off the stored quiet value, sleeping and
+   retrying up to a limit, then print the calibration next to every
+   table. Reason: this session spent an hour and seven runs to obtain
+   one table whose controls were quiet, and the decision of which run to
+   publish had to be made by hand from the logs. The cost is 4 s per
+   stage and a stored constant per machine; the gain is that a number
+   printed by the script is a number taken on a quiet machine, by
+   construction. It would also record `ps -r | head -3` before and
+   after, which this session had to do by hand.
+2. *Measure, then fix, the cache footprint of the Q3 hash table.* The
+   hypothesis from the seven runs is that colstore's Q3 lost 3-5x under
+   contention (0.181 s quiet, 0.549-0.955 s loaded) while SQLite's lost
+   2x, because the 262,144-slot table (24-byte slots, 6.3 MB, plus 3.2 MB
+   of aggregate state, m4 entry) is about 9.5 MB and every row is a
+   random probe into it, so it lives in the shared cache and in
+   memory bandwidth, which a neighbour takes away; SQLite's index-ordered
+   scan is sequential. The measurement is `perf`-equivalent counters on
+   macOS (`xctrace` or the `kperf` path) for L2 misses on Q3 with and
+   without a synthetic neighbour; the fix, if confirmed, is the
+   hash-partitioned aggregation already on the list, which also shrinks
+   each thread's table to 1/T of the groups, or a radix partition of the
+   selected rows by key before probing so each partition's table fits a
+   private cache. Reason: this is the only place in the benchmark where
+   colstore's advantage was fragile, and a result that depends on the
+   neighbours is a weaker result than one that does not.
+3. *Small-domain bitmaps for dictionary columns, now with the exact
+   bill.* Q1 is lost 22.5x and the loss grew from 19.6x in the first
+   write-up only because colstore's Q1 moved from 0.055 to 0.063 s; the
+   fix is unchanged (one bitmap per dictionary value per chunk, AND and
+   popcount per row group, no decode), and the measurement that would
+   decide whether it goes in is the ingest cost and footer growth, which
+   this session can bound from `info`: 13 bitmaps of 8 KiB over 153
+   groups is 16.3 MB uncompressed, a tenth of the file, before the
+   `event_type` bitmaps collapse to runs. Reason: the brief's resume
+   sentence says "faster than SQLite" and the table says "except on
+   equality counts"; this is the item that would remove the exception.
+4. *Pin the comparison to a cold-cache run.* Every number here is with
+   both files in the page cache, which favours the engine that reads
+   less only mildly (both are CPU-bound warm). On a cold cache the 54 MB
+   colstore reads for Q3 against SQLite's 488 MB table should widen the
+   gap by the disk's share; the account cannot run `sudo purge`, so the
+   alternative is a file larger than memory (100M events, 5.2 GB raw,
+   1.6 GB `.col`, 9 GB `.sqlite`), which the script already supports
+   through its `N` argument and which would also test the row-group
+   streaming of both engines rather than their cached scans. Reason: the
+   compression claim and the "encoding-aware scans" claim are both
+   stronger cold, and the write-up says so without proving it.
+5. *Make `colstore_sqlite` print its own calibration.* SQLite's Q1
+   covering-index count (2.7-2.8 ms, 10.4 ns per entry) was the most
+   stable cell in all seven runs; it is a good in-process control for
+   the SQLite side the way the ingest is for colstore, and printing it
+   first in `query` mode would let the script reject a SQLite timing the
+   same way as item 1 rejects a colstore one.
+
+The two leftovers from the m4 re-verification (`effective_order()`'s
+unused `schema` parameter, `columns_needed()` rebuilt per batch) are
+still as described and still untouched: neither changes a number, and
+this session changed no code on purpose.
+
+## 2026-10-21 13:50 EDT: integration re-verified from the current tree (no code change)
+
+**Situation.** The brief for this session asked to build the streamkit ->
+colstore integration (`ingest --in-csv`, a schema general enough for the
+six-column aggregate table, `bench/e2e.sh`, NOTES entries on the boundary).
+All of it was already in the tree and committed (`0dff510`, 12:16 EDT):
+format version 2 with the schema in the footer, `CsvRowSource`,
+`verify --csv`, `q --check-csv`, the e2e harness, the "integration" entry
+above and its twin in `streamkit/NOTES.md`. As with the m2 to m5
+re-verifications earlier today, rewriting working, tested code to match
+a stale brief would discard the verification it already has, so no source
+file changed. What this session did instead was re-verify the integration
+"done when" from fresh configures of `build-int`, `build-int-asan` and
+`build-int-tsan` and record the run.
+
+**Why the boundary is CSV, in one paragraph (the long form is in the
+integration entry above, Decision 5, and in streamkit's).** The CSV
+already existed, is already what `bench/compare.sh` diffs against the
+oracle, and has the one property streamkit's checkpoint protocol needs:
+its length is its state, so a resume can truncate to a byte count. A
+binary record would save parse time (six `from_chars` per row, about half
+of the 0.68 s the aggregate ingest takes here) but almost no bytes
+(decimal integers are short); an Arrow-style stream would in addition
+carry the types with the data (today `write_csv_header` and
+`aggregate_schema()` are two copies of one convention, checked by a
+header string compare) and let colstore ingest columns as windows close
+instead of after the file is complete. Neither is needed while the stages
+run one after another on one machine; a live ingest or a column added on
+one side only would change the answer.
+
+**Verification (this session, Apple M5 Pro, 18 hardware threads).**
+
+- Fresh `cmake -S . -B build-int{,-asan,-tsan} -G Ninja
+  -DCMAKE_BUILD_TYPE=Release [-DADSTACK_SANITIZE=address|thread]` then
+  `cmake --build <tree> --clean-first`: 49 translation units per tree,
+  exactly one `warning:` line per tree, in GoogleTest's own
+  `gtest-printers.h` (the known third-party one), 0 in any project TU.
+  sqlite3 found in all three, so `colstore_sqlite` and its tests built.
+- `ctest --test-dir <tree> -j 8`: 207/207 in Release (11.7 s), ASan+UBSan
+  (17.3 s) and TSan (36.8 s); 0 lines matching `sanitizer` or
+  `runtime error` in any log.
+- `bench/e2e.sh build-int 5000000 /private/tmp/adstack-cs/e2e-rel 4`,
+  run twice. Both E2E PASS, exit 0, every count identical to the
+  committed run (49,791 dups, 246,957 late, 3,735,840 windows, 5
+  checkpoint epochs, 80,386,496 and 16,587,534 bytes, 13 of 58 aggregate
+  row groups skipped, the same top 10 led by campaign 20307 at
+  15,931,296). The first run started at load 10.3 (the other track was
+  rebuilding) and the second at 4.9; the second is the one to quote:
+
+  | step | result | wall s |
+  |---|---|---:|
+  | gen | 5,000,000 events, 4,950,209 unique, 49,791 dups, 246,957 late | 0.314 |
+  | oracle | 49,791 dups dropped, 3,735,840 windows | 2.220 |
+  | streamkit | same counts, 0 late, 0.79 s engine, 6.36M events/s, 4 threads, 5 epochs committed | 0.800 |
+  | compare.sh | 3,735,840 windows identical | 13.956 |
+  | colstore ingest events.ads | 5,000,000 rows, 0.927 s engine, 77 groups; 260,000,008 -> 80,386,496 bytes | 0.938 |
+  | colstore verify events | all 10 columns of 5,000,000 rows identical | 0.424 |
+  | colstore ingest aggregates.csv | 3,735,840 rows, 0.677 s engine (5.52M rows/s), 58 groups; 127,086,825 -> 16,587,534 bytes | 0.687 |
+  | colstore verify aggregates | all 6 columns of 3,735,840 rows identical | 0.479 |
+  | Q1 / Q2 / Q3 (--check) | engine 0.010 / 0.035 / 0.061 s at 4 threads; 1 / 100,000 / 100,000 groups identical | 0.239 / 1.315 / 1.884 |
+  | Q4 top-10 spend in the hour (--check-csv) | engine 0.027 s; 13 of 58 groups skipped; 100,000 groups and 10 ordered rows identical | 0.793 |
+  | awk from the oracle's CSV | top 10 identical | 3.404 |
+
+  Against the committed run (load 3 to 7): streamkit 0.79 s vs 0.76 s,
+  event ingest 0.927 s vs 0.78 s wall, aggregate ingest 0.677 s vs 0.47
+  s, Q1-Q3 engine 0.010 / 0.035 / 0.061 vs 0.007 / 0.026 / 0.045 s. The
+  first run of this session (load 10.3) was slower still (aggregate
+  ingest 0.820 s, Q3 0.116 s), the same shared-machine effect the m4 and
+  m5 entries document; every count was identical across all three runs,
+  only wall-clock moved.
+- `bench/e2e.sh build-int-asan 1000000 ... 4` with
+  `ASAN_OPTIONS=log_path=...` / `UBSAN_OPTIONS=log_path=...`, and
+  `bench/e2e.sh build-int-tsan 1000000 ... 4` with
+  `TSAN_OPTIONS=log_path=...`, run concurrently: both E2E PASS, exit 0,
+  and the `log_path` directory stayed empty, i.e. zero sanitizer reports
+  from any of the eleven processes in either pipeline. (`log_path` was
+  used because the script's exit trap deletes the per-step stderr logs
+  that a report would otherwise land in.)
+- The nonzero-exit requirement, re-proved: a scratchpad "build dir" with
+  symlinks to the real `build-int/bin` binaries except for an `oracle`
+  wrapper that runs the real oracle and then adds 1 to the cost of row
+  1000 of its CSV. `bench/e2e.sh <shim> 200000 ... 4`: `compare
+  streamkit vs oracle | FAIL: outputs differ`, `E2E FAIL: 1 step(s)
+  failed`, exit 1. The awk top-10 step still PASSed because row 1000's
+  campaign is not in the top 10 of the chosen hour, which is why the
+  byte-for-byte `compare.sh` step exists and is not redundant with the
+  end-answer checks. The shim lived only in the session scratchpad and is
+  gone.
+
+**Files touched this session.** This file, `colstore/README.md` (one
+clause on the integration status line), `streamkit/NOTES.md` and
+`streamkit/README.md` (the same, from the producer's side). No source,
+no script, no CMake file changed. `/private/tmp/adstack-cs/e2e-*` work
+dirs were removed by the harness itself; the run logs under
+`/private/tmp/adstack-cs/` were deleted at the end of the session.
