@@ -16,7 +16,9 @@ Nothing from an earlier session is quoted here; the decision log in
   `sysctl hw.perflevel0/1`), 24 GB, macOS 26.4.1 (Darwin 25.4.0), APFS on
   the internal SSD
 - Apple clang 21.0.0 (clang-2100.0.123.102), `-O3` (CMake Release),
-  project flags `-Wall -Wextra -Wpedantic -Wshadow -Wconversion`
+  project flags `-Wall -Wextra -Wpedantic -Wshadow -Wconversion
+  -Wno-sign-conversion` (the last one turns off the sign-conversion half of
+  clang's `-Wconversion`; root CMakeLists.txt)
 - `build-sk` configured with
   `cmake -S . -B build-sk -G Ninja -DCMAKE_BUILD_TYPE=Release`
 - **The machine was shared for most of the session.** The other track's
@@ -83,9 +85,16 @@ to 1.93x at 2 threads, 2.8 to 3.8x at 4, 4.5 to 5.6x at 8; reader stalls
 fall from ~72K to ~2K and idle waits rise, so the workers are the
 bottleneck until 8 threads and then only just), while the absolute level
 moved by almost 2x between runs A, C and D on the same binary and input.
-A single thread does not care about a load average of 4 on 18 cores, so
-what moved it is the neighbour's effect on the memory system and the SSD,
-not CPU time; run E is what the engine does when that stops.
+Why the level moved is a hypothesis, not a finding: either the
+neighbour's effect on the memory system and the SSD, or scheduling (6
+Super + 12 Performance cores, with Chrome, `fseventsd` and the neighbour
+competing for the fast cluster) fits these data, and nothing here
+separates the two (that needs per-run getrusage and core-cluster pinning).
+Run E is the best of six runs, not a typical one: an independent reviewer
+re-ran the cells on 2026-10-24 at load 2.8 to 4.6 and got 3.1M / 6.2M /
+12.0M / 18.1M (retry 20.5M at 8), the same speedup shape (2.01x / 3.91x /
+5.88x) at about two thirds of the level, and section 8 below has this
+session's re-run. Quote the range and the shape, not run E alone.
 
 ## 2. Dedup overhead
 
@@ -176,7 +185,8 @@ much as the checkpoints, which is why they range from -22% to -32% for
 the same work. Second, the stable number is the cost of one snapshot:
 total / 80 = 30.2 ms (A), 33.4 (C), 39.6 (D), 38.9 (E) at the default
 interval and 33.4 / 34.0 / 42.4 / 34.5 ms at the 100K interval (serialize
-~2.3 MB per worker, three F_FULLFSYNCs, eight workers hitting the same
+~2.3 MB per worker, two F_FULLFSYNCs plus a plain directory fsync at the
+time (three F_FULLFSYNCs since the 2026-10-24 review fixes), eight workers hitting the same
 SSD at once). The arithmetic that says the snapshot is the whole cost, per
 run: 10 epochs x per-snapshot cost = 0.30 / 0.33 / 0.40 / 0.39 s, against
 a wall-time increase of 0.20 / 0.32 / 0.34 / 0.33 s (10M events at the
@@ -185,7 +195,10 @@ part of the snapshot time overlapped with the reader filling the queues.
 At benchmark speed the default interval is a checkpoint every 70 to 120 ms
 of wall time, which no one would run; at the generator's own rate (10K
 events/s simulated, which `--pace` replays) the same interval is one
-checkpoint every 100 s and 30 to 40 ms per 100 s is 0.03 to 0.04%. The
+checkpoint every 100 s and 30 to 40 ms per 100 s is 0.03 to 0.04%. That
+is derived arithmetic, not a run: no 10K events/s checkpointed run was
+measured. The measured overhead is the -22% to -32% at benchmark speed in
+the tables above. The
 100K row is the density the crash harness needs so that a random SIGKILL
 lands mid-epoch; it is not a configuration to run in.
 

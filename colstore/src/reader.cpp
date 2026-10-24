@@ -4,6 +4,8 @@
 
 #include <stdexcept>
 
+#include "src/crc32c.h"
+
 namespace colstore {
 
 ColReader::ColReader(const std::string& path) : path_(path) {
@@ -66,6 +68,13 @@ std::vector<uint8_t> ColReader::read_chunk_bytes(size_t row_group, ColumnId col)
   const ChunkMeta& m = chunk(row_group, col);
   std::vector<uint8_t> bytes(static_cast<size_t>(m.length));
   read_at(m.offset, bytes.data(), bytes.size());
+  // Every chunk is checked on every read, before any decoder sees it: the
+  // decoders catch structural damage, the checksum catches the rest (a
+  // flipped bit that still decodes to some value).
+  if (crc32c(bytes.data(), bytes.size()) != m.crc32c) {
+    throw std::runtime_error("chunk checksum mismatch (row group " + std::to_string(row_group) + ", column " +
+                             spec_of(footer_.columns, col).name + "): " + path_ + " is corrupt");
+  }
   return bytes;
 }
 

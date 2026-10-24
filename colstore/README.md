@@ -9,8 +9,11 @@ colstore -> query` runs end to end (`bench/e2e.sh`). A `.col` file is row
 groups of 65,536 rows, one chunk per column, an encoding chosen per chunk
 (PLAIN, DICT, DELTA_BP, RLE_DICT), and a footer that carries the table's
 schema (column names and integer types) plus per-chunk metadata including
-min/max. Queries run as a vectorized scan (batches of 1024 rows, selection
-vectors, zone-map row-group skipping, dictionary predicates on codes) into
+min/max and a CRC-32C of every chunk (the footer is checksummed too, so a
+flipped bit anywhere in the file is an error, not a different answer).
+Queries decode each needed chunk whole, then filter and aggregate it in
+batches of 1024 rows (selection vectors, zone-map row-group skipping,
+dictionary predicates on codes) into
 a hash aggregate (GROUP BY with count / sum / min / max and conditional
 count_if / sum_if, open-addressing table, optionally one thread per set of
 row groups) followed by ORDER BY / LIMIT. Every query can be re-derived
@@ -27,7 +30,7 @@ From the repository root (cmake and ninja live in
 ```
 cmake -S . -B build-cs -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build-cs
-ctest --test-dir build-cs -R "Footer|Schema|RowGroup|Fixture|Codecs|Selector|BitPack|BitWidth|Dictionary|Predicate|ZoneMap|WhereParser|Exec|GroupTable|KeyPacker|Agg|HashAggregate|OrderParser|SortLimit|QueryFiles|SqliteLoader|CsvRowSource|AggregateTable|AggregateFiles|Widen"
+ctest --test-dir build-cs -R "Footer|Schema|RowGroup|Fixture|Codecs|Selector|BitPack|BitWidth|Dictionary|Predicate|ZoneMap|WhereParser|Exec|GroupTable|KeyPacker|Agg|HashAggregate|OrderParser|SortLimit|QueryFiles|SqliteLoader|CsvRowSource|AggregateTable|AggregateFiles|Widen|Crc32c|Corruption"
 ```
 
 Targets: `colstore` (CLI), `colstore_core` (static library: format,
@@ -40,7 +43,7 @@ everything else builds. `ctest -j N` is safe: every test's temp files
 carry a per-process token (`tests/test_util.h`), because ctest runs each
 gtest case as its own process. The `Agg` pattern above also matches one
 `common/` test (`Agg.CountsByTypeAndSumsCost` from `tests/`), so ctest
-reports 129 entries for the 128 colstore tests.
+reports 143 entries for the 142 colstore tests.
 
 ## Usage
 
@@ -71,7 +74,8 @@ build-cs/bin/colstore scan --in events.col \
   --cols campaign_id,cost_micros --limit 10 --stats
 #   --limit 0   all rows      --count   print only the number of passing rows
 #   --stats     row groups skipped by zone map / by dictionary, rows decoded, chunks read, time
-#   --vector N  batch size (default 1024; 1 = row-at-a-time, for the measurement in NOTES.md)
+#   --vector N  filter/aggregate batch size (default 1024; 1 = row-at-a-time dispatch; decode is
+#               always a whole chunk whatever N is; for the measurement in NOTES.md)
 
 # prove a query: the same predicate through the scan and through a brute-force
 # loop over the .ads file; row counts and per-column sums must agree
@@ -83,19 +87,29 @@ build-cs/bin/colstore q --in events.col \
   --where "event_time_us BETWEEN 1767225900000000 AND 1767229500000000" \
   --group campaign_id --agg "sum(cost_micros),count()" \
   --order "sum_cost_micros desc" --limit 20 --threads 4 --stats
-#   --group a,b       group columns (omit for one global row); any columns whose widths fit in 128 bits
+#   --group a,b       group columns; any set whose widths sum to at most 128 bits, in any order.
+#                     Omit for one global row, which is emitted even when no row matches
+#                     (count 0, sum/min/max NULL, printed as an empty field, as in SQL)
 #   --agg "..."       count(), sum(col), min(col), max(col), count_if(cond), sum_if(col, cond),
 #                     each optionally "AS name"; cond is one --where term, e.g. event_type=1
 #                     default names: count, sum_<col>, min_<col>, max_<col>, count_if_<col>_<op>_<v>, ...
 #   --order "a desc, b"  output column names; group columns are appended as a tiebreak,
 #                     so the output is identical at any --threads
-#   --limit N         0 = all rows (default). With no --order the rows come out in first-seen order
+#   --limit N         0 = all rows (default). With --limit and no --order the rows are ordered by
+#                     the group columns ascending; with neither, they come out in the order the
+#                     groups were first seen (thread 0's groups first; SQL promises no order here)
 #   --threads T       row groups t, t+T, ... per thread, one hash table each, merged at the end
 #   --stats           groups skipped, rows, groups, table slots and doublings, probes per row, times
 #                     (doublings and probes are summed over every thread's table and the merge)
-#   --check events.ads  recompute the whole GROUP BY from the .ads file (std::map, no shared code
-#                     with the engine) and diff; with --order/--limit also diff the emitted rows
-#                     against a plain std::stable_sort. Exit 1 on any difference.
+#   --check events.ads  recompute the whole GROUP BY from the .ads file with a std::map and diff;
+#                     with --order/--limit also diff the emitted rows against a plain
+#                     std::stable_sort. Exit 1 on any difference. It shares no code with the
+#                     hash table, the key packer or the scanner, but it does share the parsed
+#                     plan, Predicate::matches (which count_if / sum_if also use), less_in_type
+#                     and the ORDER BY tiebreak, so a misreading of the query's meaning passes
+#                     it; the cross-engine diff against SQLite in bench/colstore_bench.sh is
+#                     what catches those (a SQLite comparison is how the zero-row global
+#                     aggregate bug was found; the diff now runs that case, NOTES.md "Review fixes").
 #   --check-csv aggregates.csv  the same for an aggregate-table query, reading the CSV back
 
 # the same engine on the aggregate table: column names are the file's own, and every query
@@ -202,7 +216,8 @@ colstore::QueryStats q = colstore::run_query(r, where, cols, [&](const colstore:
 `Scanner` walks row groups, consults the zone maps (per-chunk min/max)
 before reading anything, decodes only the columns the query touches, and
 hands out `Batch`es of up to 1024 rows whose column vectors point into the
-decoded row group. `apply_filter` fills the selection vector branch-free;
+decoded row group (decode is per chunk, filter and aggregate per batch;
+the loops are branch-free and scalar, not SIMD). `apply_filter` fills the selection vector branch-free;
 `gather` densifies one column of the survivors. Dictionary-coded chunks
 are kept as codes and filtered on a code range computed once per row
 group.

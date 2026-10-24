@@ -29,9 +29,12 @@
 // producer's writes to tail_ do not invalidate the consumer's head_ line
 // (false sharing). Each side also keeps a private cached copy of the other
 // side's index and only reloads it when the queue looks full (producer) or
-// empty (consumer). On a steady stream that turns one cross-core cache-line
-// transfer per operation into one per wrap, which is the difference between
-// the queue being a bottleneck and being invisible.
+// empty (consumer). While the producer is ahead (the queue holds several
+// slots) that turns one cross-core cache-line transfer per operation into
+// one per wrap, which is the difference between the queue being a
+// bottleneck and being invisible. A consumer that has caught up (empty
+// queue, e.g. on a paced live stream) reloads tail_ on every try_front, so
+// there the saving is on the producer side only.
 //
 // IN-PLACE API. Besides try_push/try_pop by value, the queue exposes the slot
 // itself: the producer claims a slot, fills it and publishes; the consumer

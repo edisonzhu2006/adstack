@@ -5,6 +5,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "src/crc32c.h"
 #include "src/encoding.h"
 #include "src/predicate.h"  // event_row_bits(): the Event -> widened-row view
 
@@ -120,13 +121,12 @@ ChunkMeta ColWriter::write_chunk(const ColumnBuffer& col) {
   }
 
   m.encoding = static_cast<uint32_t>(enc);
-  if (enc == Encoding::Plain) {
-    m.length = col.used;
-    write_bytes(col.bytes.data(), col.used);
-  } else {
-    m.length = scratch_.size();
-    write_bytes(scratch_.data(), scratch_.size());
-  }
+  // The checksum covers exactly the bytes written, so a reader can tell a
+  // flipped bit anywhere in the chunk from a valid value (crc32c.h).
+  const uint8_t* data = enc == Encoding::Plain ? col.bytes.data() : scratch_.data();
+  m.length = enc == Encoding::Plain ? col.used : scratch_.size();
+  m.crc32c = crc32c(data, static_cast<size_t>(m.length));
+  write_bytes(data, static_cast<size_t>(m.length));
   return m;
 }
 

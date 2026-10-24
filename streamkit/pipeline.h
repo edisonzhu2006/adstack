@@ -13,10 +13,19 @@
 //          \--> queue[1] ---> worker 1 (dedup set, open windows, watermark, out.part1)
 //           \-> ...
 //
-// Nothing on the hot path is shared between threads. The only cross-thread
-// traffic is the queue itself (spsc_queue.h), and the reader publishes
-// batches, not single events, so even that is one cache-line handoff per
-// kBatchEvents events.
+// No mutable state of ours is shared between threads on the hot path: the
+// only cross-thread traffic we create is the queue itself (spsc_queue.h),
+// and the reader publishes batches, not single events, so even that is one
+// cache-line handoff per Config::batch_events events. The process-wide
+// allocator and libc are still shared: every new dedup id and every new
+// window allocates a node, every closed window frees one and formats a row
+// through fprintf. NOTES.md (m5) measures a per-row cost that grows with
+// the worker count and attributes it to that shared machinery.
+//
+// The exception is --out - (stdout): workers then write each batch's rows
+// straight to stdout under one mutex so a consumer sees a row as soon as
+// its window closes (StreamSink below), one lock per batch that emitted
+// rows, not per event.
 //
 // Partitioning by campaign_id is also what keeps dedup exact with no shared
 // set: a duplicate is a byte-for-byte copy of its original, so it carries the
@@ -28,7 +37,10 @@
 // output is interleaved across partitions (compare.sh sorts, so correctness
 // is unaffected). See NOTES.md for the comparison with a global watermark.
 //
-// EACH WORKER HAS ITS OWN OUTPUT FILE (<out>.part<i>). Appending to one
+// EACH WORKER HAS ITS OWN OUTPUT FILE (<out>.part<i>) when --out is a file.
+// Rows then become visible only at the end of the run, when the parts are
+// merged and renamed into place (that rename is the run's commit, which is
+// what makes checkpoint/resume exactly-once). Appending to one
 // shared file would need a lock per row. More importantly, m4's checkpoint
 // records "this worker's output is N bytes long" and truncates back to N on
 // resume; that is only well defined when the worker alone writes the file.
@@ -48,6 +60,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -99,6 +112,16 @@ struct Config {
   bool latency_stats = false;
 };
 
+// --out - only: the shared destination workers write their rows to as
+// windows close. One lock per batch that emitted rows; each write is
+// followed by fflush, so the bytes are in the pipe (or file) behind stdout
+// when the lock is released. No checkpoints in this mode (plan_start
+// refuses --ckpt-dir with --out -), so nothing ever needs truncating.
+struct StreamSink {
+  std::mutex mu;
+  FILE* f = nullptr;
+};
+
 // Which worker owns a campaign. Deterministic across runs and machines (m4's
 // resume depends on a campaign landing on the same part file after a
 // restart). Not plain `campaign_id % partitions`: the mixing step makes the
@@ -145,6 +168,15 @@ struct WorkerStats {
   uint64_t events = 0;
   uint64_t dups = 0;
   uint64_t late = 0;
+  // Of `late`, the events that were also past the dedup horizon (Dedup's
+  // kExpired). The engine no longer remembers their ids, so it cannot tell
+  // a genuinely late first copy from a re-delivery of an event it already
+  // counted (or already wrote to the late file). Aggregates are unaffected
+  // (dedup.h has the proof); the late side file is not deduplicated for
+  // these, so a consumer that re-adds late events must dedup them by
+  // event_id against the output first. Zero whenever the dedup horizon
+  // (window + lateness) covers the stream's re-delivery delay.
+  uint64_t expired = 0;
   uint64_t windows_emitted = 0;
   uint64_t batches = 0;
   uint64_t idle_waits = 0;   // times the worker found its queue empty
@@ -167,8 +199,10 @@ class Worker {
   // resume: state to start from (nullptr = fresh). With a resume snapshot the
   // part files are truncated to the recorded lengths and continued; without
   // one they are created empty.
+  // sink: --out - streaming destination (nullptr = write out_part_path).
   Worker(int id, const Config& cfg, std::string out_part_path, std::string late_part_path,
-         CheckpointCoordinator* coord = nullptr, const WorkerSnapshot* resume = nullptr);
+         CheckpointCoordinator* coord = nullptr, const WorkerSnapshot* resume = nullptr,
+         StreamSink* sink = nullptr);
   ~Worker();
   Worker(const Worker&) = delete;
   Worker& operator=(const Worker&) = delete;
@@ -204,6 +238,8 @@ class Worker {
   // false at end of input (finish), whose closings are not emit latency.
   void close_ready(bool record_latency);
   void process_batch(const Batch& b);
+  // --out -: write the rows collected since the last call to the sink.
+  void flush_stream();
   void open_outputs_fresh();
   void open_outputs_resumed(const WorkerSnapshot& s);
   void restore(const WorkerSnapshot& s);
@@ -226,6 +262,11 @@ class Worker {
   uint64_t out_bytes_ = 0;
   std::unique_ptr<EventWriter> late_;
   CheckpointCoordinator* coord_ = nullptr;
+  // --out -: rows of the current batch, and how many of them close_ready
+  // sampled for --latency-stats (their samples are taken after the write).
+  StreamSink* sink_ = nullptr;
+  std::string pending_rows_;
+  size_t pending_samples_ = 0;
   WorkerStats stats_;
   std::string error_;
   // --latency-stats: arrival stamp of the batch being processed (0 = none)
@@ -235,7 +276,10 @@ class Worker {
 };
 
 struct PipelineResult {
-  uint64_t events = 0;           // records the reader handed out in this run
+  // Records the reader handed out in this run. On a resumed run this is
+  // less than the workers' cumulative `events` (restored from the
+  // snapshots), and it is what events/s is computed from.
+  uint64_t events = 0;
   uint64_t reader_stalls = 0;    // times the reader found a queue full (backpressure)
   // read(2) calls that returned data. On a file that is about one per MiB;
   // on a pipe it is how often the producer's bytes arrived, which is the

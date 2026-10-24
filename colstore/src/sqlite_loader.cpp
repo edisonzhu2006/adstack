@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 
 #include "common/event.h"
@@ -245,18 +246,39 @@ LoadReport load_ads(const std::string& ads_path, const std::string& db_path, con
 // ---- CSV --------------------------------------------------------------------------
 
 Db::RunReport write_query_csv(Db& db, const std::string& sql, FILE* out) {
-  // Column names are only known once the statement is prepared, inside
-  // query(), so the rows are collected first and written after the header.
-  // The results here are at most 100K short rows, so holding them is cheap,
-  // and the CSV formatting stays outside the measured time, as it does on
-  // the colstore side (q --stats excludes write_csv).
-  std::vector<std::vector<int64_t>> rows;
-  const Db::RunReport r = db.query(sql, [&](const std::vector<int64_t>& values) { rows.push_back(values); });
+  // Its own step loop rather than query(), because query() reads every
+  // value as an integer and a NULL would print as 0. NULL is an empty
+  // field here, the same text colstore's write_csv() gives a NULL cell
+  // (a global aggregate over zero rows), so the cross-engine diff can tell
+  // "SUM over nothing" from "SUM = 0". Rows are collected first and written
+  // after the header: the results are at most 100K short rows, and the
+  // formatting stays outside the measured time, as it does on the colstore
+  // side (q --stats excludes write_csv).
+  Db::RunReport r;
+  std::vector<std::vector<std::optional<int64_t>>> rows;
+  const auto t0 = std::chrono::steady_clock::now();
+  {
+    Stmt stmt(db.raw(), sql);
+    const int ncol = sqlite3_column_count(stmt.get());
+    for (int c = 0; c < ncol; ++c) r.columns.emplace_back(sqlite3_column_name(stmt.get(), c));
+    for (;;) {
+      const int rc = sqlite3_step(stmt.get());
+      if (rc == SQLITE_DONE) break;
+      if (rc != SQLITE_ROW) fail(db.raw(), "step `" + sql + "`");
+      ++r.rows;
+      std::vector<std::optional<int64_t>>& v = rows.emplace_back(static_cast<size_t>(ncol));
+      for (int c = 0; c < ncol; ++c) {
+        if (sqlite3_column_type(stmt.get(), c) != SQLITE_NULL) v[static_cast<size_t>(c)] = sqlite3_column_int64(stmt.get(), c);
+      }
+    }
+  }
+  r.seconds = seconds_since(t0);
   for (size_t i = 0; i < r.columns.size(); ++i) std::fprintf(out, "%s%s", i ? "," : "", r.columns[i].c_str());
   std::fputc('\n', out);
-  for (const std::vector<int64_t>& values : rows) {
+  for (const auto& values : rows) {
     for (size_t i = 0; i < values.size(); ++i) {
-      std::fprintf(out, "%s%lld", i ? "," : "", static_cast<long long>(values[i]));
+      if (i) std::fputc(',', out);
+      if (values[i]) std::fprintf(out, "%lld", static_cast<long long>(*values[i]));
     }
     std::fputc('\n', out);
   }

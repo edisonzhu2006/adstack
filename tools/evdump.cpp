@@ -2,6 +2,7 @@
 //   evdump --in events.ads [--n 20]
 
 #include <cstdio>
+#include <exception>
 
 #include "common/args.h"
 #include "common/event.h"
@@ -10,8 +11,15 @@ using namespace adstack;
 
 int main(int argc, char** argv) {
   Args args(argc, argv);
-  if (!args.has("--in")) { std::fprintf(stderr, "evdump --in FILE [--n 20]\n"); return 2; }
-  const int64_t n = args.i64("--n", 20);
+  const auto bad = args.unknown({"--in", "--n"});
+  if (!bad.empty() || !args.has("--in")) { std::fprintf(stderr, "evdump --in FILE [--n 20]\n"); return 2; }
+  int64_t n = 0;
+  try {
+    n = args.i64("--n", 20);
+  } catch (const std::exception& ex) {
+    std::fprintf(stderr, "evdump: %s\n", ex.what());
+    return 2;
+  }
 
   EventReader r(args.str("--in", ""));
   std::printf("%-10s %-20s %-20s %-10s %-10s %-10s %-10s %-7s %-6s %s\n",

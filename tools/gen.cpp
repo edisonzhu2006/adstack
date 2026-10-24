@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <exception>
 #include <random>
 #include <thread>
 #include <vector>
@@ -42,9 +43,7 @@ void usage() {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  Args args(argc, argv);
-  if (!args.has("--out") || args.has("--help")) { usage(); return args.has("--help") ? 0 : 2; }
+int run(const Args& args) {
 
   const int64_t n = args.i64("--n", 1'000'000);
   const uint64_t seed = static_cast<uint64_t>(args.i64("--seed", 1));
@@ -125,11 +124,29 @@ int main(int argc, char** argv) {
 
     w.write(e);
   }
-  w.flush();
+  w.close();
 
   std::fprintf(stderr, "gen: wrote %llu events (%lld unique, %lld dups, %lld late) seed=%llu\n",
                static_cast<unsigned long long>(w.count()), static_cast<long long>(next_id - 1),
                static_cast<long long>(dups), static_cast<long long>(lates),
                static_cast<unsigned long long>(seed));
   return 0;
+}
+
+int main(int argc, char** argv) {
+  Args args(argc, argv);
+  if (args.has("--help")) { usage(); return 0; }
+  const auto bad = args.unknown({"--out", "--n", "--seed", "--rate", "--dup-frac", "--late-frac", "--max-late-s",
+                                 "--zipf", "--campaigns", "--videos", "--epoch-us", "--pace"});
+  if (!bad.empty()) {
+    std::fprintf(stderr, "gen: unknown argument '%s'\n", bad.front().c_str());
+    return 2;
+  }
+  if (!args.has("--out")) { usage(); return 2; }
+  try {
+    return run(args);
+  } catch (const std::exception& ex) {
+    std::fprintf(stderr, "gen: %s\n", ex.what());
+    return 1;
+  }
 }

@@ -22,22 +22,39 @@
 //
 // Value representation inside the state, all uint64_t:
 //   count, count_if : the count
-//   sum, sum_if     : wrapping sum of the raw 64-bit patterns. For an i64
-//                     column the patterns are two's complement, so the
-//                     wrapped sum reinterpreted as int64 is the exact signed
-//                     sum (as long as it fits in 64 bits); unsigned columns
-//                     are zero-extended, so the sum is exact.
+//   sum, sum_if     : sum of the raw 64-bit patterns, modulo 2^64. For an
+//                     i64 column the patterns are two's complement, so the
+//                     result reinterpreted as int64 is the exact signed sum
+//                     whenever that sum fits in int64; for an unsigned
+//                     column it is exact whenever the sum fits in uint64.
+//                     Outside those ranges the result wraps SILENTLY: there
+//                     is no overflow check (SQLite raises "integer
+//                     overflow" instead), and the --check brute force wraps
+//                     the same way, so it cannot see it. No column of either
+//                     table gets near that today (10M events sum cost_micros
+//                     to about 10^13); a u64 id summed over many rows would.
+//                     sum_if adds 0 for a row whose condition is false, i.e.
+//                     SQL's SUM(CASE WHEN cond THEN col ELSE 0 END).
 //   min, max        : the ORDER KEY of the value (predicate.h), so one
 //                     unsigned compare works for signed and unsigned
 //                     columns alike; converted back to a value in finish().
 //
 // Group keys are packed by KeyPacker: each group column takes exactly its
-// width in bits (u8: 8, u16: 16, u32: 32, u64/i64: 64) and the columns are
-// laid out back to back in two 64-bit words, each column kept inside one
-// word (a column that does not fit in the rest of the current word starts
-// the next one). So campaign_id + country + device fit in one word and any
-// two columns fit in two; three wide columns do not and are rejected at
-// plan time with a clear message. Packing instead of hashing the columns
+// width in bits (u8: 8, u16: 16, u32: 32, u64/i64: 64) and goes, first fit,
+// into whichever of two 64-bit words still has room for all of it, so no
+// column straddles a word. For these widths first fit succeeds exactly when
+// the widths add up to at most 128 bits, whatever order the columns are
+// named in: campaign_id + country + device fit in one word, any two columns
+// fit in two, and three 64-bit columns are rejected at plan time with the
+// bit count.
+//
+// GROUP BY with no columns (a global aggregate) skips the hash table: every
+// row belongs to group 0, which exists from construction, so the answer has
+// exactly one row even when no row matched, as in SQL. That row's count and
+// count_if are 0 and its sum, sum_if, min and max are NULL (no value
+// exists); ResultTable::is_null says which cells, and the CSV leaves them
+// empty, the way SQLite's NULL prints. A GROUP BY with columns has no NULLs:
+// every group it emits saw at least one row. Packing instead of hashing the columns
 // separately makes "same group" a 128-bit compare and lets the table stay
 // key-agnostic.
 
@@ -130,17 +147,26 @@ std::vector<OutputColumn> output_columns(const std::vector<ColumnId>& group, con
                                          const Schema& schema = event_schema());
 
 // Columnar result: cols[c][r] is the raw 64-bit pattern of row r in output
-// column c, formatted with schema[c].type.
+// column c, formatted with schema[c].type. `nulls` is empty unless some
+// cell is NULL, which only the one row of a global aggregate over zero
+// rows has; then nulls[c][r] != 0 marks a NULL cell (its pattern is 0).
 struct ResultTable {
   std::vector<OutputColumn> schema;
   std::vector<std::vector<uint64_t>> cols;
+  std::vector<std::vector<uint8_t>> nulls;
 
   size_t rows() const { return cols.empty() ? 0 : cols[0].size(); }
   uint64_t at(size_t col, size_t row) const { return cols[col][row]; }
+  bool is_null(size_t col, size_t row) const { return !nulls.empty() && nulls[col][row] != 0; }
 };
 
 // Decimal text of a value of the given type (signed types print negative).
 std::string format_value(ColumnType type, uint64_t bits);
+// The text of one result cell: format_value, or "" for a NULL cell.
+std::string format_cell(const ResultTable& t, size_t col, size_t row);
+// Whether an aggregate of this kind is NULL over zero input rows (SQL:
+// COUNT is 0, SUM / MIN / MAX are NULL).
+bool null_when_empty(AggKind k);
 
 // ---- the operator --------------------------------------------------------------
 
@@ -155,8 +181,9 @@ struct AggStats {
 
 class HashAggregate {
  public:
-  // An empty `group` means one global group (plain COUNT / SUM). `schema`
-  // is the table the batches come from; group columns are resolved in it.
+  // An empty `group` means one global group (plain COUNT / SUM), which
+  // exists from construction and is filled without hashing. `schema` is
+  // the table the batches come from; group columns are resolved in it.
   HashAggregate(std::vector<ColumnId> group, std::vector<AggSpec> aggs, const Schema& schema = event_schema());
 
   // Every column the batches must have loaded: group columns, aggregated
@@ -193,6 +220,7 @@ class HashAggregate {
   GroupTable table_;
   std::vector<uint64_t> state_;      // table_.size() * aggs_.size() cells
   std::vector<uint32_t> group_of_;   // group index per selected row of the current batch
+  bool global_ = false;              // no group columns: one group, index 0, no hashing
   uint64_t rows_ = 0;
   uint64_t batches_ = 0;
   uint64_t merged_probes_ = 0;  // probes and doublings of tables merged into this one,

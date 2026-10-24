@@ -129,7 +129,7 @@ void write_csv(FILE* out, const QueryResult& r) {
     line.clear();
     for (size_t c = 0; c < t.schema.size(); ++c) {
       if (c) line += ',';
-      line += format_value(t.schema[c].type, t.at(c, row));
+      line += format_cell(t, c, row);  // empty for NULL, as SQLite prints it
     }
     line += '\n';
     std::fputs(line.c_str(), out);
@@ -164,6 +164,7 @@ namespace {
 
 using KeyBits = std::vector<uint64_t>;   // group column patterns
 using Cells = std::vector<uint64_t>;     // one per aggregate, same representation as the table
+using Nulls = std::vector<bool>;         // one per aggregate: true = the expected cell is NULL
 
 // Plain per-row update written independently of HashAggregate: signed
 // compares through less_in_type, no order keys, no packing. `row` is one
@@ -194,19 +195,37 @@ Cells brute_initial(const QueryPlan& plan, const uint64_t* first) {
   return c;
 }
 
-std::string row_text(const ResultTable& t, const KeyBits& key, const Cells& cells) {
+std::string row_text(const ResultTable& t, const KeyBits& key, const Cells& cells, const Nulls& nulls) {
   std::string s;
   for (size_t c = 0; c < t.schema.size(); ++c) {
+    const bool null = c >= key.size() && nulls[c - key.size()];
     const uint64_t v = c < key.size() ? key[c] : cells[c - key.size()];
-    s += (c ? "," : "") + format_value(t.schema[c].type, v);
+    s += (c ? "," : "") + (null ? std::string("NULL") : format_value(t.schema[c].type, v));
   }
   return s;
 }
 
 std::string engine_row_text(const ResultTable& t, uint32_t row) {
   std::string s;
-  for (size_t c = 0; c < t.schema.size(); ++c) s += (c ? "," : "") + format_value(t.schema[c].type, t.at(c, row));
+  for (size_t c = 0; c < t.schema.size(); ++c) {
+    s += (c ? "," : "") + (t.is_null(c, row) ? std::string("NULL") : format_value(t.schema[c].type, t.at(c, row)));
+  }
   return s;
+}
+
+// Engine row `row` against the expected key + cells + NULL flags: every
+// key cell equal and never NULL, every aggregate cell NULL exactly when
+// expected and otherwise equal.
+bool row_equals(const ResultTable& t, size_t row, const KeyBits& key, const Cells& cells, const Nulls& nulls) {
+  for (size_t c = 0; c < key.size(); ++c) {
+    if (t.is_null(c, row) || t.at(c, row) != key[c]) return false;
+  }
+  for (size_t a = 0; a < cells.size(); ++a) {
+    const size_t c = key.size() + a;
+    if (t.is_null(c, row) != nulls[a]) return false;
+    if (!nulls[a] && t.at(c, row) != cells[a]) return false;
+  }
+  return true;
 }
 
 }  // namespace
@@ -230,6 +249,7 @@ CheckReport check_against_rows(RowSource& rows, const QueryPlan& plan, const Que
 
   // 1. Brute force: every row, std::map keyed by the group values.
   std::map<KeyBits, Cells> truth;
+  Nulls truth_nulls(plan.aggs.size(), false);  // a GROUP BY's groups all saw a row: nothing is NULL
   {
     std::vector<uint64_t> row;
     KeyBits key(ng);
@@ -240,6 +260,17 @@ CheckReport check_against_rows(RowSource& rows, const QueryPlan& plan, const Que
       if (it == truth.end()) it = truth.emplace(key, brute_initial(plan, row.data())).first;
       brute_update(plan, row.data(), it->second);
     }
+  }
+  // SQL: an aggregate without GROUP BY returns one row even over zero input
+  // rows; COUNT is 0 there and SUM / MIN / MAX are NULL. Spelled out here
+  // from the SQL rule, not from HashAggregate's representation.
+  if (ng == 0 && truth.empty()) {
+    Cells empty(plan.aggs.size(), 0);
+    for (size_t a = 0; a < plan.aggs.size(); ++a) {
+      const AggKind k = plan.aggs[a].kind;
+      truth_nulls[a] = !(k == AggKind::Count || k == AggKind::CountIf);
+    }
+    truth.emplace(KeyBits{}, empty);
   }
 
   // 2. Every engine group must be in the truth with identical cells, and
@@ -256,13 +287,13 @@ CheckReport check_against_rows(RowSource& rows, const QueryPlan& plan, const Que
     for (size_t a = 0; a < plan.aggs.size(); ++a) cells[a] = t.at(ng + a, row);
     const auto it = truth.find(key);
     if (it == truth.end()) {
-      rep.detail = "engine group not found by brute force: " + row_text(t, key, cells);
+      rep.detail = "engine group not found by brute force: " + engine_row_text(t, static_cast<uint32_t>(row));
       rep.seconds = seconds_since(t0);
       return rep;
     }
-    if (it->second != cells) {
-      rep.detail = "aggregates differ for group: engine " + row_text(t, key, cells) + " / brute force " +
-                   row_text(t, key, it->second);
+    if (!row_equals(t, row, key, it->second, truth_nulls)) {
+      rep.detail = "aggregates differ for group: engine " + engine_row_text(t, static_cast<uint32_t>(row)) +
+                   " / brute force " + row_text(t, key, it->second, truth_nulls);
       rep.seconds = seconds_since(t0);
       return rep;
     }
@@ -294,13 +325,11 @@ CheckReport check_against_rows(RowSource& rows, const QueryPlan& plan, const Que
     }
     for (size_t i = 0; i < want; ++i) {
       const uint32_t row = r.rows[i];
-      for (size_t c = 0; c < t.schema.size(); ++c) {
-        if (t.at(c, row) != value(sorted[i], c)) {
-          rep.detail += "; output row " + std::to_string(i) + " differs: engine " + engine_row_text(t, row) +
-                        " vs brute force " + row_text(t, sorted[i].first, sorted[i].second);
-          rep.seconds = seconds_since(t0);
-          return rep;
-        }
+      if (!row_equals(t, row, sorted[i].first, sorted[i].second, truth_nulls)) {
+        rep.detail += "; output row " + std::to_string(i) + " differs: engine " + engine_row_text(t, row) +
+                      " vs brute force " + row_text(t, sorted[i].first, sorted[i].second, truth_nulls);
+        rep.seconds = seconds_since(t0);
+        return rep;
       }
     }
     rep.detail += "; " + std::to_string(want) + " ordered output rows identical";

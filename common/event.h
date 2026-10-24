@@ -56,12 +56,21 @@ class EventWriter {
                 // header and records, write the header only if it is empty
   };
   explicit EventWriter(const std::string& path, Mode mode = Mode::kTruncate);  // "-" = stdout
+  // Best effort and never throws (a destructor that throws during unwinding
+  // terminates the process): flushes and closes, ignoring errors. Code that
+  // needs to know the records reached the file calls close() first.
   ~EventWriter();
   EventWriter(const EventWriter&) = delete;
   EventWriter& operator=(const EventWriter&) = delete;
 
   void write(const Event& e);
+  // Hands the buffered records to the OS (fwrite + fflush). Throws
+  // std::runtime_error on a short write or a failed fflush (ENOSPC, EIO).
   void flush();
+  // flush() plus fclose, both checked; throws on failure. After close() the
+  // writer accepts no more records and the destructor does nothing. For
+  // stdout the stream is flushed but not closed.
+  void close();
   // flush() plus fsync (F_FULLFSYNC on Apple), so the records are on disk
   // before a checkpoint claims they are. Throws on failure.
   void sync();

@@ -96,7 +96,16 @@ std::vector<uint64_t> read_dictionary(Cursor& c, ColumnType type) {
   const uint32_t d = c.u32("dictionary size");
   c.need(static_cast<size_t>(d) * value_width(type), "dictionary");
   std::vector<uint64_t> dict(d);
-  for (uint32_t i = 0; i < d; ++i) dict[i] = c.value(type, "dictionary");
+  for (uint32_t i = 0; i < d; ++i) {
+    dict[i] = c.value(type, "dictionary");
+    // Strictly ascending in the column's order is part of the format, not a
+    // convenience: the scanner maps a predicate to a code range with binary
+    // searches on this array (Scanner::compile_predicate), so an unsorted
+    // dictionary would filter wrongly while decoding to the right values.
+    if (i > 0 && !less_in_type(dict[i - 1], dict[i], type)) {
+      throw std::runtime_error("corrupt chunk: dictionary not strictly ascending");
+    }
+  }
   return dict;
 }
 
@@ -407,10 +416,15 @@ size_t encode_delta_bp(const uint64_t* values, size_t n, std::vector<uint8_t>& o
   return out.size() - start;
 }
 
-std::vector<uint64_t> decode_delta_bp(const uint8_t* data, size_t len, uint32_t rows) {
+std::vector<uint64_t> decode_delta_bp(const uint8_t* data, size_t len, uint32_t rows, ColumnType type) {
   Cursor c(data, len);
   check_count(c.u32("count"), rows);
   std::vector<uint64_t> out(rows);
+  // DELTA_BP is the one codec whose output is computed rather than read at
+  // the column's width, so it is the one that can produce a pattern that
+  // does not fit a u8/u16/u32 column. OR-ing every value costs one
+  // instruction per value and one test per chunk.
+  uint64_t all_bits = 0;
   for (size_t b = 0; b < rows; b += kDeltaBlock) {
     const size_t m = std::min(kDeltaBlock, rows - b);
     const uint64_t first = c.u64("block first value");
@@ -422,13 +436,17 @@ std::vector<uint64_t> decode_delta_bp(const uint8_t* data, size_t len, uint32_t 
     bits.require(m - 1, width);
     uint64_t prev = first;
     out[b] = first;
+    all_bits |= first;
     for (size_t k = 1; k < m; ++k) {
       prev += base + bits.get(width);  // wrapping, mirrors the encoder
       out[b + k] = prev;
+      all_bits |= prev;
     }
     c.skip(packed_bytes(m - 1, width), "block deltas");
   }
   c.expect_end("delta blocks");
+  const size_t w = value_width(type);
+  if (w < 8 && (all_bits >> (8 * w)) != 0) throw std::runtime_error("corrupt chunk: value exceeds column width");
   return out;
 }
 
@@ -484,17 +502,18 @@ std::vector<uint64_t> decode_chunk(Encoding enc, const uint8_t* data, size_t len
                                    ColumnType type) {
   switch (enc) {
     case Encoding::Plain: {
-      Cursor c(data, len);
       if (len != static_cast<size_t>(rows) * value_width(type)) {
         throw std::runtime_error("plain chunk: byte length does not match row count");
       }
-      std::vector<uint64_t> out(rows);
-      for (uint32_t i = 0; i < rows; ++i) out[i] = c.value(type, "plain values");
+      // Length checked once above, then one typed load-and-widen loop
+      // (the type switch is per chunk, not per value).
+      std::vector<uint64_t> out;
+      widen_bytes(type, data, rows, out);
       return out;
     }
     case Encoding::Dict: return decode_dict(data, len, rows, type);
     case Encoding::RleDict: return decode_rle_dict(data, len, rows, type);
-    case Encoding::DeltaBp: return decode_delta_bp(data, len, rows);
+    case Encoding::DeltaBp: return decode_delta_bp(data, len, rows, type);
   }
   throw std::runtime_error("unsupported encoding id " + std::to_string(static_cast<uint32_t>(enc)));
 }

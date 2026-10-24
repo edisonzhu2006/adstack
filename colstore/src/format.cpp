@@ -5,6 +5,8 @@
 #include <cctype>
 #include <stdexcept>
 
+#include "src/crc32c.h"
+
 namespace colstore {
 
 namespace {
@@ -17,7 +19,7 @@ void put_chunk_meta(uint8_t*& p, const ChunkMeta& m) {
   put_le(p, m.min_bits);
   put_le(p, m.max_bits);
   put_le(p, m.null_count);
-  put_le(p, m.reserved);
+  put_le(p, m.crc32c);
 }
 
 ChunkMeta get_chunk_meta(const uint8_t*& p) {
@@ -29,8 +31,16 @@ ChunkMeta get_chunk_meta(const uint8_t*& p) {
   m.min_bits = get_le<uint64_t>(p);
   m.max_bits = get_le<uint64_t>(p);
   m.null_count = get_le<uint32_t>(p);
-  m.reserved = get_le<uint32_t>(p);
+  m.crc32c = get_le<uint32_t>(p);
   return m;
+}
+
+// CRC-32C of a footer body with its checksum field read as zero.
+uint32_t footer_checksum(const uint8_t* data, size_t len) {
+  static constexpr uint8_t kZero[4] = {0, 0, 0, 0};
+  uint32_t c = crc32c(data, kFooterCrcOffset);
+  c = crc32c(kZero, 4, c);
+  return crc32c(data + kFooterCrcOffset + 4, len - kFooterCrcOffset - 4, c);
 }
 
 // The --where grammar's identifier rule (predicate.cpp): a name that could
@@ -167,18 +177,32 @@ std::vector<uint8_t> encode_footer(const Footer& f) {
     put_le(p, rg.rows);
     for (const auto& c : rg.chunks) put_chunk_meta(p, c);
   }
+  reseal_footer(out);
   return out;
+}
+
+void reseal_footer(std::vector<uint8_t>& body) {
+  if (body.size() < kFooterFixedSize) throw std::invalid_argument("reseal_footer: not a footer");
+  const uint32_t c = footer_checksum(body.data(), body.size());
+  uint8_t* p = body.data() + kFooterCrcOffset;
+  put_le(p, c);
 }
 
 Footer decode_footer(const uint8_t* data, size_t len) {
   if (len < kFooterFixedSize) throw std::runtime_error("footer truncated");
+  {
+    const uint8_t* q = data + kFooterCrcOffset;
+    if (get_le<uint32_t>(q) != footer_checksum(data, len)) {
+      throw std::runtime_error("footer checksum mismatch: the footer is corrupt or truncated");
+    }
+  }
   const uint8_t* p = data;
   const uint8_t* const end = data + len;
   const uint32_t num_groups = get_le<uint32_t>(p);
   const uint32_t num_columns = get_le<uint32_t>(p);
   Footer f;
   f.rows_per_group = get_le<uint32_t>(p);
-  (void)get_le<uint32_t>(p);  // reserved
+  (void)get_le<uint32_t>(p);  // footer_crc32c, checked above
   f.total_rows = get_le<uint64_t>(p);
 
   if (num_columns == 0 || num_columns > kMaxColumns) throw std::runtime_error("footer: bad column count");

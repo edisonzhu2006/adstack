@@ -43,8 +43,9 @@ which is conservative: it keeps up to one extra bucket of ids, never fewer.
 Three verdicts fall out of this: `kNew` (stored), `kDuplicate` (dropped,
 counted in `dups`), `kExpired` (`event_time < forget_before`, not stored).
 `kExpired` is not an error path: by the proof above the late check that
-follows is guaranteed to divert the event, so `main.cpp` just passes it
-through. The unit test `ExpiredImpliesLateForEveryTimestampNearTheHorizon`
+follows is guaranteed to divert the event, so the caller (then `main.cpp`,
+since m3 `Worker::process` in `pipeline.cpp`) just passes it through (and,
+since "Review fixes", also counts it as `expired`). The unit test `ExpiredImpliesLateForEveryTimestampNearTheHorizon`
 checks this implication exhaustively for every microsecond in a band around
 the horizon, for several watermarks and bucket widths including an odd one
 (7.000003s), so no rounding corner is taken on faith.
@@ -84,9 +85,12 @@ check changes nothing there.
   negative check would be sound, but the exact set already answers "not
   seen" in one hash lookup, so it would add work without removing any.
 - **Per-id expiry (min-heap or ordered map on event_time).** Exact and
-  bounded, but it pays O(log n) per insert and per expiry, and expiry walks
-  one id at a time. Bucketing expires thousands of ids in one `pop_front`,
-  and the insert is one hash-set insert. The cost is granularity: we keep up
+  bounded, but it pays O(log n) per insert to keep ids ordered by
+  event_time. Bucketing drops a whole bucket with one `pop_front` of
+  bookkeeping, and the insert is one hash-set insert. (Corrected in "Review
+  fixes": the bucket's `clear()` still frees every node one at a time, so
+  expiry costs one free per id either way; the saving is the ordering work
+  on insert, not the per-id expiry.) The cost is granularity: we keep up
   to one bucket (1s default) of ids longer than strictly needed.
 - **`std::map`/`std::set` per bucket.** Ordered lookup buys nothing; ids are
   only ever asked "have I seen you". Hash set.
@@ -250,8 +254,9 @@ with an acquire load of that index before reading the slot, is all the
 synchronization there is (`spsc_queue.h` spells the ordering out). A shared
 MPMC queue would need CAS loops and would put every event's handoff on one
 contended cache line. A mutex-protected `std::deque` would be simpler to
-write and roughly ten times slower per handoff, and would serialize the
-reader against eight workers.
+write and, I expect, several times slower per handoff (an expectation, not
+a measurement: no mutex-deque variant was ever benchmarked), and would
+serialize the reader against eight workers.
 
 Three details worth defending:
 
@@ -445,8 +450,9 @@ should decide whether 1024 is the better trade.
 ### Alternatives considered and rejected
 
 - **One shared `std::map` and dedup set behind a mutex.** Simplest, and
-  every event would take the lock twice. Measured nothing because the
-  outcome is known: slower than one thread.
+  every event would take the lock twice. Not measured; the expectation
+  (slower than one thread, since every event serializes on one lock) is
+  reasoning, not data.
 - **Concurrent hash map (sharded locks or lock-free).** Would scale the
   dedup set, but the windows still need ordered closing per key, and there
   is no lock-free ordered map in the standard library. Partitioning gets
@@ -606,7 +612,10 @@ but forget the name. On macOS `fsync` only pushes data to the drive's write
 cache; `fcntl(F_FULLFSYNC)` asks the drive to flush that cache too, so
 `durable_sync()` uses it on Apple and falls back to `fsync` where the file
 system refuses (some network and external volumes). The part files get the
-same treatment before their lengths are recorded.
+same treatment before their lengths are recorded. (Corrected in "Review
+fixes": until 2026-10-24 the directory sync used plain `fsync`, which by
+this paragraph's own reasoning only reaches the drive cache on macOS;
+`durable_sync_dir()` now uses `F_FULLFSYNC` too.)
 
 The checksum (FNV-1a over the snapshot) is belt and braces: rename already
 guarantees a `.snap` is complete, but a 64-bit hash turns a bug or a disk
@@ -623,6 +632,7 @@ the file at every interesting place.
 | after MANIFEST rename, before deleting k-1 | `epoch-(k-1)/` and `epoch-k/`, MANIFEST says k | k-1 deleted, resume from k |
 | final merge | `<out>.tmp` partial, parts intact, MANIFEST says last k | merge redone from the parts after replaying the tail |
 | after output rename, before deleting the checkpoint dir | output complete, MANIFEST says k | tail replayed and output rewritten with the same bytes (idempotent) |
+| while deleting the checkpoint dir (added in "Review fixes") | MANIFEST removed and its directory synced first, then the rest in any order: either a complete checkpoint or no MANIFEST | as the row above, or as the row below; never "MANIFEST names a missing epoch" |
 | after deleting the checkpoint dir, before deleting parts | output complete, no MANIFEST | `--resume` finds nothing committed and starts from byte 0, rewriting the same bytes |
 | before the first epoch commits | no MANIFEST | start from byte 0 |
 
@@ -691,7 +701,10 @@ Reading the table:
 - Of those 35 ms, fsync is 28 ms and serializing 2.3 MB is 7 ms
   (`--no-fsync` isolates it). The microbenchmark says why: F_FULLFSYNC of a
   2 MB file is 6 ms alone (plain `fsync` 0.3 ms, no sync 0.4 ms), and each
-  snapshot does three of them (part file, snapshot file, directory) while
+  snapshot does three syncs (part file, snapshot file, directory; corrected
+  in "Review fixes": two of those were F_FULLFSYNC and the directory one a
+  plain fsync, and from 2026-10-24 all three are F_FULLFSYNC, four with
+  `--late-out`) while
   seven other workers are doing the same, so the drive serializes 24 cache
   flushes per epoch. At P=1 the fsync share is 21 ms of 70 ms and the
   encode of 18 MB (iterating a million-node hash set, FNV over the bytes)
@@ -700,7 +713,9 @@ Reading the table:
   checkpoint every 36 ms, which is 10 to 100 times more often than anyone
   would checkpoint a real stream. At the generator's own rate (10K events/s
   simulated, which is what `--pace` replays) the default is one checkpoint
-  every 100 s, and 35 ms every 100 s is 0.035%. The 100K-event row is the
+  every 100 s, and 35 ms every 100 s is 0.035%. That figure is derived
+  arithmetic for a stream that was never run; the measured cost at
+  benchmark speed is the -22% to -32% in `BENCHMARKS.md` section 3. The 100K-event row is the
   harness setting and exists to make the crash test dense, not to run in.
 - `--no-fsync` is a measurement knob like `--no-dedup`: a checkpoint written
   without it still survives SIGKILL (the kernel has the bytes) but not a
@@ -747,7 +762,8 @@ Reading the table:
   deleted), 2 `DedupState.*`, 2 `WorkerResume.*` (truncate both part files
   and replay to byte-identical output, with a post-checkpoint duplicate
   proving the dedup state came back; a part shorter than its snapshot is an
-  error), 6 `PipelineCheckpoint.*` (checkpointed run is byte-identical to a
+  error), 5 `PipelineCheckpoint.*` (the entry said 6; there were 5, and 9
+after "Review fixes") (checkpointed run is byte-identical to a
   plain run and removes its directory; fail after marker 7 then resume at 1
   and 4 threads is byte-identical to the plain run for both the CSV and the
   late file, and the stale directory without `--resume` and a resume with a
@@ -1179,6 +1195,12 @@ was handed over.
 
 ## 2026-10-21: m5, benchmarks and the emit-latency metric
 
+> Superseded numbers: this morning entry's figures (p50 6.7 / p99 12.9 ms at
+> 8 threads, p99 8.4 ms at 4, 1.0 to 1.1 us per row at 8 workers, 92.5 to
+> 102.4 MiB, dedup 25.6%) were re-measured in the afternoon entry below and
+> in `BENCHMARKS.md`, and the latency end point itself changed in "Review
+> fixes" (2026-10-24). Read them as the morning's run, not current values.
+
 **Problem.** The plan's m5 is a table: throughput vs threads, p50/p99
 emit latency under paced replay, memory, dedup overhead, every cell
 reproducible by `bench/throughput.sh`. Two of those are plain
@@ -1233,7 +1255,14 @@ Why that and not the alternatives:
   could close the window, which is what "could first have passed" has to
   mean. The gap to the first qualifying event in *any* partition is one
   partition inter-arrival time, about P x 5 us at 200K events/s.
-- **Stop the clock after `fprintf`, not after flush or fsync.** The row is
+- **Stop the clock after `fprintf`, not after flush or fsync.** (Withdrawn
+  in "Review fixes": the next sentence was not true of the code. With a
+  file `--out` no consumer sees any row before the run commits at end of
+  input, and with `--out -` the rows were also only written after every
+  worker joined. Since 2026-10-24 `--out -` streams each batch's rows to
+  stdout as windows close and the clock stops after that write; with a
+  file the metric is labelled "appended to part buffer, not yet
+  visible".) The row is
   available to the engine's consumer once it is in the stream; the 1 MiB
   flush happens every ~23K rows and belongs to no particular window, and
   fsync is a checkpoint matter. Timing the flush would make the p99 a
@@ -1822,3 +1851,59 @@ as windows close rather than after the file is complete. The cost of
 either is a third format plus a block-aware resume rule, which nothing
 needs until an ingest must keep up with streamkit live or a column is
 added on one side only.
+
+## 2026-10-24: review fixes
+
+An independent correctness review rebuilt the tree under ASan, UBSan and
+TSan and tried to break it. Everything it confirmed is listed here with
+what changed. The fixing session stalled before writing this entry, so it
+was written afterwards from the diff and the new tests.
+
+**Extreme timestamps (high).** One record with `event_time` near
+INT64_MIN made `for_each_window_start` overflow and loop forever; near
+INT64_MAX the event was silently called late. The oracle had the same bug.
+Fix: `common/agg.h` now bounds every timestamp to |t| <= 2^62 us (about
+146,000 years from 1970) and every duration to 2^50 us, which keeps all
+window arithmetic under 2^63 by construction. Records outside the range are
+corruption, not late events, so both streamkit and the oracle reject them
+with the same error (`check_event_time`) instead of feeding them to
+undefined behaviour. Tests: `ExtremeEventTimesFailLoudlyInsteadOfOverflowing`,
+`EventTimesAtTheSupportedLimitsAreAggregatedExactly`.
+
+**Resume against the wrong input (medium).** The MANIFEST did not pin the
+input, so `--resume` on a different file produced wrong output and exited
+0, which contradicts the exactly-once claim. Fix: the MANIFEST records an
+input fingerprint (size plus a hash of the head and tail) and resume
+refuses on mismatch. Test: `ResumeAgainstADifferentInputIsRefused`.
+
+**Changing the checkpoint interval on resume (medium).** Epoch numbers were
+derived from the new interval, so a resume with a different
+`--checkpoint-every-events` could reuse the committed epoch's directory and
+overwrite its snapshots, and a crash in that window was unrecoverable. Fix:
+the interval is pinned in the MANIFEST and a mismatch is refused. Test:
+`ResumeWithADifferentIntervalIsRefused`. The same applies to `--late-out`,
+whose presence is now pinned too (`ResumeThatAddsOrDropsLateOutIsRefused`).
+
+**Crash during cleanup (medium).** `fs::remove_all` deletes in directory
+order, and on APFS the epoch directory was often removed before MANIFEST, so
+a crash there left a MANIFEST pointing at nothing and the next resume
+refused to run. Fix: MANIFEST is removed first and the directory synced, so
+any crash during cleanup looks like "no checkpoint", which is the documented
+start-over path. Test: `CrashDuringCleanupNeverLeavesAManifestWithoutItsEpoch`.
+
+**Late counter overstated (medium).** When re-delivery delay exceeds the
+dedup horizon, a copy of an already-counted event can reach the late side
+file. Aggregates were always exact (the review confirmed this against an
+unbounded reference). Fix: such events are counted separately as `expired`
+rather than inflating `late`, and the counter survives resume. Tests:
+`ExpiredLateEventsAreCountedSeparately`, `ExpiredCounterSurvivesResume`.
+The side file can still contain such copies; that is stated, not hidden.
+
+**Low.** Unchecked int64 cost sums: within the timestamp and generator
+ranges a window would need ~10^12 billable events to overflow; documented.
+Integer flags are now parsed strictly (`common/args.cpp`), so a typo like
+`--threads 8x` is an error instead of a silent prefix.
+
+**Verification.** Clean Release and ASan builds, 241/241 tests in each
+(207 before), `bench/smoke.sh` 8/8 PASS, `bench/crash.sh` rerun after the
+checkpoint format change (result in BENCHMARKS.md).

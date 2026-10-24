@@ -80,6 +80,7 @@ WorkerSnapshot sample_snapshot() {
   s.events = 875'001;
   s.dups = 8'750;
   s.late = 12;
+  s.expired = 5;
   s.windows_emitted = 40'000;
   for (uint32_t c = 0; c < 50; ++c) {
     Agg a;
@@ -101,11 +102,11 @@ WorkerSnapshot sample_snapshot() {
 }
 
 // Byte layout of a snapshot, from the format comment in checkpoint.h: magic +
-// version (8), the fixed fields up to and including n_windows (96), 44 per
+// version (8), the fixed fields up to and including n_windows (104), 44 per
 // open window, the dedup header (25), 8 per bucket count, 8 per id, 8 of
 // checksum. Pinned here so a silent change to the format fails a test.
 constexpr size_t kSnapHeader = 8;
-constexpr size_t kSnapFixed = 96;
+constexpr size_t kSnapFixed = 104;
 constexpr size_t kSnapPerWindow = 44;
 constexpr size_t kSnapDedupHeader = 25;
 
@@ -119,6 +120,10 @@ Manifest sample_manifest() {
   m.lateness_us = 60 * kS;
   m.dedup_bucket_us = kS;
   m.dedup = true;
+  m.checkpoint_every_events = 1'000'000;
+  m.late_out = true;
+  // Hashes above INT64_MAX must survive the text round trip.
+  m.input = InputFingerprint{8 + 52 * 20'000'000ULL, 0xF00DFACE12345678ULL, 0x0123456789ABCDEFULL};
   return m;
 }
 
@@ -676,4 +681,208 @@ TEST(PipelineCheckpoint, PipeInputCannotBeCheckpointed) {
   }
   writer.join();
   fs::remove_all(d);
+}
+
+// ---- review fixes (2026-10-24): what a resume must refuse, and cleanup order ----------------
+
+namespace {
+
+// Run 1 of a resume scenario: checkpoint every 1000 events, die after the
+// 5th marker, leave MANIFEST naming epoch 5.
+Config died_after_epoch_5(const fs::path& d, int threads) {
+  Config ck = pipeline_config(d, "ck", threads);
+  ck.ckpt_dir = (d / "ckpt").string();
+  ck.checkpoint_every_events = 1000;
+  ck.fail_after_checkpoint = 5;
+  EXPECT_NE(run_pipeline(ck).error.find("fail_after_checkpoint"), std::string::npos);
+  EXPECT_EQ(parse_manifest(slurp(manifest_path(ck.ckpt_dir))).epoch, 5u);
+  ck.fail_after_checkpoint = 0;
+  ck.resume = true;
+  return ck;
+}
+
+// Expects run_pipeline(cfg) to refuse with a message containing `what`,
+// and the checkpoint to be left exactly as it was (still resumable).
+void expect_refused(const Config& cfg, const std::string& what) {
+  const std::string before = slurp(manifest_path(cfg.ckpt_dir));
+  try {
+    run_pipeline(cfg);
+    ADD_FAILURE() << "expected a refusal mentioning: " << what;
+  } catch (const std::runtime_error& ex) {
+    EXPECT_NE(std::string(ex.what()).find(what), std::string::npos) << ex.what();
+  }
+  EXPECT_EQ(slurp(manifest_path(cfg.ckpt_dir)), before);
+  EXPECT_TRUE(fs::exists(snapshot_path(cfg.ckpt_dir, 5, 0)));
+}
+
+}  // namespace
+
+TEST(PipelineCheckpoint, ResumeAgainstADifferentInputIsRefused) {
+  // Before the fix this resumed silently and produced output matching
+  // neither input. Same size, same record count, different content.
+  const fs::path d = scratch_dir("ckpt_other_input");
+  write_stream((d / "in.ads").string(), 20'000);
+  Config plain = pipeline_config(d, "plain", 3);
+  ASSERT_TRUE(run_pipeline(plain).error.empty());
+  Config ck = died_after_epoch_5(d, 3);
+
+  // Same length, one record changed near the end (the tail block differs).
+  const std::string other = (d / "other.ads").string();
+  fs::copy_file(ck.in_path, other);
+  {
+    const int fd = ::open(other.c_str(), O_WRONLY);
+    ASSERT_GE(fd, 0);
+    const uint8_t junk[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    ASSERT_EQ(::pwrite(fd, junk, sizeof junk, static_cast<off_t>(fs::file_size(other) - 52)), 8);
+    ::close(fd);
+  }
+  Config swapped = ck;
+  swapped.in_path = other;
+  expect_refused(swapped, "input file is not the one");
+
+  // A grown input (appended to after the checkpoint) is a different input too.
+  const std::string grown = (d / "grown.ads").string();
+  fs::copy_file(ck.in_path, grown);
+  {
+    EventWriter w(grown, EventWriter::Mode::kAppend);
+    w.write(make(999'999, 1000 * kS, 1));
+    w.close();
+  }
+  Config longer = ck;
+  longer.in_path = grown;
+  expect_refused(longer, "input file is not the one");
+
+  // The original input still resumes to the uninterrupted output.
+  PipelineResult r = run_pipeline(ck);
+  ASSERT_TRUE(r.error.empty()) << r.error;
+  EXPECT_EQ(slurp(ck.out_path), slurp(plain.out_path));
+  fs::remove_all(d);
+}
+
+TEST(PipelineCheckpoint, ResumeWithADifferentIntervalIsRefused) {
+  // Epoch k means "the first k*N events"; a new N would number the next
+  // epoch onto the committed epoch's directory (k = 5 at N = 1000 and at
+  // N = 1100 for the marker at 5500) and overwrite its snapshots in place.
+  const fs::path d = scratch_dir("ckpt_interval");
+  write_stream((d / "in.ads").string(), 20'000);
+  Config ck = died_after_epoch_5(d, 2);
+  Config other = ck;
+  other.checkpoint_every_events = 1100;
+  expect_refused(other, "--checkpoint-every-events differs");
+  fs::remove_all(d);
+}
+
+TEST(PipelineCheckpoint, ResumeThatAddsOrDropsLateOutIsRefused) {
+  // Before the fix, dropping --late-out exited 0, never produced the late
+  // file and left its parts behind; adding it failed on a missing part.
+  const fs::path d = scratch_dir("ckpt_late_out");
+  write_stream((d / "in.ads").string(), 20'000);
+  Config ck = died_after_epoch_5(d, 2);
+  Config dropped = ck;
+  dropped.late_out_path.clear();
+  expect_refused(dropped, "wrote --late-out and this one does not");
+  fs::remove_all(d);
+
+  const fs::path d2 = scratch_dir("ckpt_late_out_added");
+  write_stream((d2 / "in.ads").string(), 20'000);
+  Config start = pipeline_config(d2, "ck", 2);
+  start.late_out_path.clear();
+  start.ckpt_dir = (d2 / "ckpt").string();
+  start.checkpoint_every_events = 1000;
+  start.fail_after_checkpoint = 5;
+  EXPECT_FALSE(run_pipeline(start).error.empty());
+  Config added = start;
+  added.fail_after_checkpoint = 0;
+  added.resume = true;
+  added.late_out_path = (d2 / "late.ads").string();
+  expect_refused(added, "adds --late-out");
+  fs::remove_all(d2);
+}
+
+TEST(PipelineCheckpoint, CrashDuringCleanupNeverLeavesAManifestWithoutItsEpoch) {
+  // Cleanup after the output rename used to be one fs::remove_all, which on
+  // APFS can delete epoch-k before MANIFEST. A crash in between left
+  // "MANIFEST names epoch k, epoch-k missing", and --resume hard-failed
+  // although the output was complete. remove_checkpoint_dir() now deletes
+  // MANIFEST first, so the only intermediate state is "no MANIFEST, epoch
+  // directory still there", which resumes by starting over.
+  const fs::path d = scratch_dir("ckpt_cleanup");
+  write_stream((d / "in.ads").string(), 20'000);
+  Config plain = pipeline_config(d, "plain", 3);
+  ASSERT_TRUE(run_pipeline(plain).error.empty());
+  Config ck = died_after_epoch_5(d, 3);
+
+  // The state the old order could produce is still (rightly) corruption.
+  {
+    const fs::path copy = d / "ckpt_copy";
+    fs::copy(ck.ckpt_dir, copy, fs::copy_options::recursive);
+    fs::remove_all(epoch_dir(copy, 5));
+    EXPECT_THROW(prepare_resume(copy), std::runtime_error);
+    fs::remove_all(copy);
+  }
+
+  // The state the new order produces: MANIFEST gone, epoch-5 still there,
+  // part files from the dead run. Resume starts over and matches.
+  fs::remove(manifest_path(ck.ckpt_dir));
+  ASSERT_TRUE(fs::exists(epoch_dir(ck.ckpt_dir, 5)));
+  PipelineResult r = run_pipeline(ck);
+  ASSERT_TRUE(r.error.empty()) << r.error;
+  EXPECT_FALSE(r.resumed);
+  EXPECT_EQ(slurp(ck.out_path), slurp(plain.out_path));
+  EXPECT_EQ(slurp(ck.late_out_path), slurp(plain.late_out_path));
+  EXPECT_FALSE(fs::exists(ck.ckpt_dir));
+
+  // remove_checkpoint_dir itself: everything goes, MANIFEST included.
+  const fs::path c = d / "ckpt2";
+  write_fake_snapshot(c, 3, 0, 1);
+  Manifest m = sample_manifest();
+  m.epoch = 3;
+  m.partitions = 1;
+  atomic_write_file(manifest_path(c), format_manifest(m));
+  remove_checkpoint_dir(c, true);
+  EXPECT_FALSE(fs::exists(c));
+  remove_checkpoint_dir(c, true);  // a missing directory is not an error
+  fs::remove_all(d);
+}
+
+TEST(InputFingerprint, CoversSizeHeadAndTail) {
+  const fs::path d = scratch_dir("fingerprint");
+  const fs::path p = d / "f.bin";
+  auto fp = [&] {
+    const int fd = ::open(p.c_str(), O_RDONLY);
+    EXPECT_GE(fd, 0);
+    const InputFingerprint f = fingerprint_input(fd);
+    EXPECT_EQ(::lseek(fd, 0, SEEK_CUR), 0) << "pread must not move the offset";
+    ::close(fd);
+    return f;
+  };
+  spit(p, std::string(3 << 20, 'a'));  // 3 MiB: head and tail blocks do not overlap
+  const InputFingerprint a = fp();
+  EXPECT_EQ(a.size, 3u << 20);
+  std::string s(3 << 20, 'a');
+  s[(3 << 20) - 1] = 'b';
+  spit(p, s);
+  const InputFingerprint tail_changed = fp();
+  EXPECT_EQ(tail_changed.head_fnv, a.head_fnv);
+  EXPECT_NE(tail_changed.tail_fnv, a.tail_fnv);
+  s[(3 << 20) - 1] = 'a';
+  s[0] = 'b';
+  spit(p, s);
+  EXPECT_NE(fp().head_fnv, a.head_fnv);
+  spit(p, "");  // empty file: both hashes are of zero bytes
+  EXPECT_EQ(fp().size, 0u);
+  fs::remove_all(d);
+}
+
+TEST(Snapshot, ExpiredCounterSurvivesResume) {
+  WorkerSnapshot s = sample_snapshot();
+  s.expired = 1234;
+  EXPECT_EQ(decode_snapshot(encode_snapshot(s)).expired, 1234u);
+  // A version-1 snapshot (no expired field) is refused, not misread.
+  std::vector<uint8_t> v1 = encode_snapshot(s);
+  const uint32_t one = 1;
+  std::memcpy(v1.data() + 4, &one, 4);
+  const uint64_t sum = fnv1a64(v1.data(), v1.size() - 8);
+  std::memcpy(v1.data() + v1.size() - 8, &sum, 8);
+  EXPECT_THROW(decode_snapshot(v1), std::runtime_error);
 }

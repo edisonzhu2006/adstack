@@ -109,8 +109,9 @@ struct LoadReport {
 LoadReport load_ads(const std::string& ads_path, const std::string& db_path, const LoadOptions& opt);
 
 // Writes the result of one query as CSV: header from the column names, then
-// one line per row, integers in decimal. Matches colstore's write_csv()
-// shape so the bench script can diff the two engines' answers.
+// one line per row, integers in decimal and NULL as an empty field. Matches
+// colstore's write_csv() shape (including its empty NULL cells) so the bench
+// script can diff the two engines' answers.
 Db::RunReport write_query_csv(Db& db, const std::string& sql, FILE* out);
 
 }  // namespace colstore::sqlite_bench

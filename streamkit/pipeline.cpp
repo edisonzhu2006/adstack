@@ -89,6 +89,8 @@ class BlockReader {
   // a clear message, not a wrong result after a resume.
   bool seekable() const { return ::lseek(fd_, 0, SEEK_CUR) >= 0; }
 
+  int fd() const { return fd_; }
+
   // Total size in bytes (seekable inputs only).
   uint64_t size() const {
     struct stat st {};
@@ -176,8 +178,10 @@ void concat_parts(const std::vector<std::string>& parts, FILE* out, size_t skip_
   for (size_t i = 0; i < parts.size(); ++i) {
     FILE* f = std::fopen(parts[i].c_str(), "rb");
     if (!f) throw std::runtime_error("cannot reopen part: " + parts[i]);
-    if (i > 0 && skip_after_first > 0) {
-      std::fseek(f, static_cast<long>(skip_after_first), SEEK_SET);
+    if (i > 0 && skip_after_first > 0 &&
+        std::fseek(f, static_cast<long>(skip_after_first), SEEK_SET) != 0) {
+      std::fclose(f);
+      throw std::runtime_error("cannot seek in part: " + parts[i]);
     }
     while (true) {
       const size_t n = std::fread(buf.data(), 1, buf.size(), f);
@@ -187,7 +191,11 @@ void concat_parts(const std::vector<std::string>& parts, FILE* out, size_t skip_
         throw std::runtime_error("short write while merging parts");
       }
     }
+    // fread returns 0 on an error as well as at end of file; only ferror
+    // tells them apart, and a read error must not pass for a short part.
+    const bool read_failed = std::ferror(f) != 0;
     std::fclose(f);
+    if (read_failed) throw std::runtime_error("read error while merging part: " + parts[i]);
   }
 }
 
@@ -276,7 +284,7 @@ uint32_t partition_of(uint32_t campaign_id, uint32_t partitions) {
 // ---- worker -------------------------------------------------------------------
 
 Worker::Worker(int id, const Config& cfg, std::string out_part_path, std::string late_part_path,
-               CheckpointCoordinator* coord, const WorkerSnapshot* resume)
+               CheckpointCoordinator* coord, const WorkerSnapshot* resume, StreamSink* sink)
     : id_(id),
       cfg_(cfg),
       queue_(cfg.queue_depth),
@@ -285,7 +293,9 @@ Worker::Worker(int id, const Config& cfg, std::string out_part_path, std::string
       watermark_(LLONG_MIN),
       out_path_(std::move(out_part_path)),
       late_path_(std::move(late_part_path)),
-      coord_(coord) {
+      coord_(coord),
+      sink_(sink) {
+  if (sink_ && resume) throw std::logic_error("a streaming (--out -) worker cannot resume");
   if (resume) {
     restore(*resume);
     open_outputs_resumed(*resume);
@@ -299,11 +309,13 @@ Worker::~Worker() {
 }
 
 void Worker::open_outputs_fresh() {
-  out_ = std::fopen(out_path_.c_str(), "w");
-  if (!out_) throw std::runtime_error("cannot open output part: " + out_path_);
-  // One row is ~40 bytes; a 1 MiB stdio buffer turns ~25K rows into one write().
-  std::setvbuf(out_, nullptr, _IOFBF, 1 << 20);
   out_bytes_ = 0;
+  if (!sink_) {
+    out_ = std::fopen(out_path_.c_str(), "w");
+    if (!out_) throw std::runtime_error("cannot open output part: " + out_path_);
+    // One row is ~40 bytes; a 1 MiB stdio buffer turns ~25K rows into one write().
+    std::setvbuf(out_, nullptr, _IOFBF, 1 << 20);
+  }
   if (!late_path_.empty()) late_ = std::make_unique<EventWriter>(late_path_);
 }
 
@@ -330,6 +342,7 @@ void Worker::restore(const WorkerSnapshot& s) {
   stats_.events = s.events;
   stats_.dups = s.dups;
   stats_.late = s.late;
+  stats_.expired = s.expired;
   stats_.windows_emitted = s.windows_emitted;
   open_.clear();
   // The snapshot is in map order, so inserting with a hint at the end is
@@ -352,6 +365,7 @@ WorkerSnapshot Worker::snapshot(uint64_t epoch, uint64_t input_offset) const {
   s.events = stats_.events;
   s.dups = stats_.dups;
   s.late = stats_.late;
+  s.expired = stats_.expired;
   s.windows_emitted = stats_.windows_emitted;
   s.open_windows.assign(open_.begin(), open_.end());
   s.dedup = dedup_.export_state();
@@ -359,7 +373,7 @@ WorkerSnapshot Worker::snapshot(uint64_t epoch, uint64_t input_offset) const {
 }
 
 void Worker::checkpoint(uint64_t epoch, uint64_t input_offset) {
-  if (!coord_) throw std::logic_error("checkpoint without a coordinator");
+  if (!coord_ || !out_) throw std::logic_error("checkpoint without a coordinator or a part file");
   const auto t0 = std::chrono::steady_clock::now();
 
   // 1. The part files must be on disk before a snapshot says how long they
@@ -411,18 +425,49 @@ void Worker::close_ready(bool record_latency) {
   // every advance). So "row appended" minus "batch arrived" is the engine's
   // whole delay for that window. The clock is read after each row, so a row
   // behind others in the same call is charged for them too.
+  //
+  // With --out - the row goes into pending_rows_ instead and reaches stdout
+  // at the end of the batch (flush_stream); the sample is then taken after
+  // that write, so it measures when a consumer can read the row.
   const bool record = record_latency && cfg_.latency_stats && batch_arrival_ns_ != 0;
   while (!open_.empty()) {
     auto it = open_.begin();
     if (it->first.window_start_us + cfg_.window_us > watermark_) break;
-    out_bytes_ += write_csv_row(out_, it->first, it->second);
+    if (sink_) {
+      out_bytes_ += append_csv_row(pending_rows_, it->first, it->second);
+      if (record) ++pending_samples_;
+    } else {
+      out_bytes_ += write_csv_row(out_, it->first, it->second);
+      if (record) emit_latency_us_.push_back(elapsed_us(batch_arrival_ns_, now_ns()));
+    }
     ++stats_.windows_emitted;
     open_.erase(it);
-    if (record) emit_latency_us_.push_back(elapsed_us(batch_arrival_ns_, now_ns()));
+  }
+}
+
+void Worker::flush_stream() {
+  if (!sink_ || pending_rows_.empty()) return;
+  {
+    std::lock_guard<std::mutex> lock(sink_->mu);
+    if (std::fwrite(pending_rows_.data(), 1, pending_rows_.size(), sink_->f) != pending_rows_.size() ||
+        std::fflush(sink_->f) != 0) {
+      throw std::runtime_error("write to stdout failed");
+    }
+  }
+  pending_rows_.clear();
+  if (pending_samples_ > 0) {
+    const uint32_t us = elapsed_us(batch_arrival_ns_, now_ns());
+    emit_latency_us_.insert(emit_latency_us_.end(), pending_samples_, us);
+    pending_samples_ = 0;
   }
 }
 
 void Worker::process(const Event& e) {
+  // 0. Range check before any window arithmetic (common/agg.h): a record
+  //    outside +-2^62 us is corruption, and feeding it on would be signed
+  //    overflow (one such record used to hang the engine). Throws, which
+  //    fails the run with the record's id; the oracle rejects it the same way.
+  check_event_time(e);
   ++stats_.events;
 
   // 1. Watermark. The event that raises it can never be late under the
@@ -431,10 +476,17 @@ void Worker::process(const Event& e) {
   if (advanced) advance_watermark(e.event_time_us);
 
   // 2. Dedup. kExpired passes through: the late check below is guaranteed to
-  //    divert it (proof in dedup.h, which also covers sliding windows).
-  if (cfg_.dedup && dedup_.insert(e.event_id, e.event_time_us) == Dedup::Verdict::kDuplicate) {
-    ++stats_.dups;
-    return;
+  //    divert it (proof in dedup.h, which also covers sliding windows). It
+  //    is counted as `expired` too, because the set no longer knows whether
+  //    this id was already counted or already written to the late file.
+  bool expired = false;
+  if (cfg_.dedup) {
+    const Dedup::Verdict v = dedup_.insert(e.event_id, e.event_time_us);
+    if (v == Dedup::Verdict::kDuplicate) {
+      ++stats_.dups;
+      return;
+    }
+    expired = v == Dedup::Verdict::kExpired;
   }
 
   // 3. Late check. With sliding windows an event belongs to several windows;
@@ -447,6 +499,7 @@ void Worker::process(const Event& e) {
   const int64_t first_start = first_window_start(e.event_time_us, cfg_.window_us, cfg_.slide_us);
   if (watermark_ != LLONG_MIN && first_start + cfg_.window_us <= watermark_) {
     ++stats_.late;
+    if (expired) ++stats_.expired;
     if (late_) late_->write(e);
     return;
   }
@@ -465,6 +518,7 @@ void Worker::finish() {
   // these closings are not sampled.
   watermark_ = LLONG_MAX;
   close_ready(/*record_latency=*/false);
+  flush_stream();
   stats_.dedup_peak_ids = dedup_.peak_ids();
   if (out_) {
     if (std::fclose(out_) != 0) {
@@ -473,7 +527,10 @@ void Worker::finish() {
     }
     out_ = nullptr;
   }
-  late_.reset();  // flushes and closes the late part
+  // Checked close: a full disk must fail the run here, not vanish in a
+  // destructor (EventWriter's destructor is best effort by design).
+  if (late_) late_->close();
+  late_.reset();
 }
 
 void Worker::process_batch(const Batch& b) {
@@ -484,11 +541,12 @@ void Worker::process_batch(const Batch& b) {
   batch_arrival_ns_ = b.arrival_ns;  // 0 unless --latency-stats
   if (!b.events.empty()) {
     for (const Event& e : b.events) process(e);
-    return;
+  } else {
+    const uint8_t* p = b.raw.data();
+    const uint8_t* end = p + b.n * kEventWireSize;
+    for (; p < end; p += kEventWireSize) process(decode(p));
   }
-  const uint8_t* p = b.raw.data();
-  const uint8_t* end = p + b.n * kEventWireSize;
-  for (; p < end; p += kEventWireSize) process(decode(p));
+  flush_stream();  // --out -: this batch's rows become visible now
 }
 
 void Worker::run() {
@@ -664,7 +722,7 @@ class Reader {
   int64_t block_arrival_ns_ = 0;  // --latency-stats: when the current block was read
 };
 
-Manifest manifest_for(const Config& cfg) {
+Manifest manifest_for(const Config& cfg, const InputFingerprint& input) {
   Manifest m;
   m.partitions = static_cast<uint32_t>(cfg.threads);
   m.window_us = cfg.window_us;
@@ -672,13 +730,41 @@ Manifest manifest_for(const Config& cfg) {
   m.lateness_us = cfg.lateness_us;
   m.dedup_bucket_us = cfg.dedup_bucket_us;
   m.dedup = cfg.dedup;
+  m.checkpoint_every_events = cfg.checkpoint_every_events;
+  m.late_out = !cfg.late_out_path.empty();
+  m.input = input;
   return m;
+}
+
+// Names the first field where a MANIFEST and this run disagree, so the
+// error says what to fix.
+std::string manifest_mismatch(const Manifest& got, const Manifest& want) {
+  if (got.input != want.input) {
+    return "the input file is not the one the checkpoint was taken from (size or content differs: "
+           "MANIFEST input_size " + std::to_string(got.input.size) + ", this input " +
+           std::to_string(want.input.size) + " bytes)";
+  }
+  if (got.partitions != want.partitions) return "--threads differs from MANIFEST partitions";
+  if (got.window_us != want.window_us || got.slide_us != want.slide_us) return "--window-s or --slide-s differs";
+  if (got.lateness_us != want.lateness_us) return "--lateness-s differs";
+  if (got.dedup_bucket_us != want.dedup_bucket_us || got.dedup != want.dedup) {
+    return "--dedup-bucket-s or --no-dedup differs";
+  }
+  if (got.checkpoint_every_events != want.checkpoint_every_events) {
+    return "--checkpoint-every-events differs (MANIFEST " + std::to_string(got.checkpoint_every_events) + ")";
+  }
+  if (got.late_out != want.late_out) {
+    return got.late_out ? "the checkpointed run wrote --late-out and this one does not"
+                        : "this run adds --late-out, the checkpointed run had none";
+  }
+  return "";
 }
 
 // Decides between a fresh start and a resume, and validates the input and
 // the checkpoint directory against each other. Returns the manifest to
-// resume from, or nullopt for a fresh start.
-std::optional<Manifest> plan_start(const Config& cfg, BlockReader& in) {
+// resume from, or nullopt for a fresh start. `input` receives the input's
+// fingerprint whenever checkpoints are on (it goes into every MANIFEST).
+std::optional<Manifest> plan_start(const Config& cfg, BlockReader& in, InputFingerprint& input) {
   if (cfg.ckpt_dir.empty()) return std::nullopt;
   if (!in.seekable()) {
     // A resume needs to rewind the input to offset X; a pipe cannot be rewound.
@@ -686,6 +772,7 @@ std::optional<Manifest> plan_start(const Config& cfg, BlockReader& in) {
         "--ckpt-dir needs a seekable input file; stdin or a pipe cannot be rewound on resume");
   }
   if (cfg.out_path == "-") throw std::runtime_error("--ckpt-dir needs --out to be a file (its parts are truncated on resume)");
+  input = fingerprint_input(in.fd());
   if (!cfg.resume) {
     if (checkpoint_dir_has_state(cfg.ckpt_dir)) {
       throw std::runtime_error("checkpoint directory " + cfg.ckpt_dir +
@@ -695,15 +782,16 @@ std::optional<Manifest> plan_start(const Config& cfg, BlockReader& in) {
   }
   std::optional<Manifest> m = prepare_resume(cfg.ckpt_dir);
   if (!m) return std::nullopt;  // nothing committed yet: start over from byte 0
-  // Everything but the epoch and offset must match this run's flags: a
-  // different thread count would route campaigns to other workers' state,
-  // and different window parameters would make the snapshots meaningless.
-  Manifest expected = manifest_for(cfg);
+  // Everything but the epoch and offset must match this run (Manifest has
+  // the reason for each field).
+  Manifest expected = manifest_for(cfg, input);
   expected.epoch = m->epoch;
   expected.input_offset = m->input_offset;
   if (*m != expected) {
-    throw std::runtime_error(
-        "resume: flags differ from the checkpoint's (threads, window, slide, lateness, dedup must match MANIFEST)");
+    const std::string why = manifest_mismatch(*m, expected);
+    throw std::runtime_error("resume refused: " + (why.empty() ? std::string("MANIFEST differs") : why) +
+                             "; rerun with the original flags and input, or remove " + cfg.ckpt_dir +
+                             " to start over");
   }
   const uint64_t size = in.size();
   if (m->input_offset > size || (m->input_offset - kFileHeaderSize) % kEventWireSize != 0) {
@@ -720,17 +808,24 @@ PipelineResult run_pipeline(const Config& cfg) {
   if (cfg.slide_us <= 0 || cfg.slide_us > cfg.window_us) {
     throw std::invalid_argument("need 0 < slide <= window");
   }
+  // The window arithmetic is overflow-free only within these bounds
+  // (common/agg.h, "supported ranges").
+  if (cfg.window_us > kMaxDurationUs || cfg.lateness_us < 0 || cfg.lateness_us > kMaxDurationUs ||
+      cfg.dedup_bucket_us <= 0 || cfg.dedup_bucket_us > kMaxDurationUs) {
+    throw std::invalid_argument("window, lateness and dedup bucket must be in [0, 2^50 us] (bucket > 0)");
+  }
 
   const auto t0 = std::chrono::steady_clock::now();
   PipelineResult result;
 
   // Open the input first: it decides whether a checkpointed run is possible.
   BlockReader in(cfg.in_path);
-  const std::optional<Manifest> resume_from = plan_start(cfg, in);
+  InputFingerprint input;
+  const std::optional<Manifest> resume_from = plan_start(cfg, in, input);
   uint64_t start_offset = kFileHeaderSize;
   std::unique_ptr<CheckpointCoordinator> coord;
   if (!cfg.ckpt_dir.empty()) {
-    coord = std::make_unique<CheckpointCoordinator>(cfg.ckpt_dir, manifest_for(cfg), cfg.fsync);
+    coord = std::make_unique<CheckpointCoordinator>(cfg.ckpt_dir, manifest_for(cfg, input), cfg.fsync);
   }
   if (resume_from) {
     start_offset = resume_from->input_offset;
@@ -740,11 +835,22 @@ PipelineResult run_pipeline(const Config& cfg) {
   }
   result.resumed_offset = start_offset;
 
-  const std::string dir = part_dir_for(cfg.out_path);
+  // --out -: rows stream to stdout as windows close (StreamSink), so there
+  // are no output parts; the header goes out before any worker starts. Only
+  // a late side file still needs parts, and for those the temp directory.
+  const bool streaming = cfg.out_path == "-";
+  std::unique_ptr<StreamSink> sink;
+  if (streaming) {
+    sink = std::make_unique<StreamSink>();
+    sink->f = stdout;
+    write_csv_header(stdout);
+    if (std::fflush(stdout) != 0) throw std::runtime_error("write to stdout failed");
+  }
+  const std::string dir = streaming && !cfg.late_out_path.empty() ? part_dir_for(cfg.out_path) : "";
   std::vector<std::string> out_parts, late_parts;
   std::vector<std::unique_ptr<Worker>> workers;
   for (int i = 0; i < cfg.threads; ++i) {
-    out_parts.push_back(part_path(dir, cfg.out_path, i));
+    if (!streaming) out_parts.push_back(part_path(dir, cfg.out_path, i));
     std::string late;
     if (!cfg.late_out_path.empty()) {
       late = part_path(dir, cfg.late_out_path, i);
@@ -757,8 +863,8 @@ PipelineResult run_pipeline(const Config& cfg) {
         throw std::runtime_error("resume: snapshot and MANIFEST disagree for worker " + std::to_string(i));
       }
     }
-    workers.push_back(std::make_unique<Worker>(i, cfg, out_parts.back(), late, coord.get(),
-                                               snap ? &*snap : nullptr));
+    workers.push_back(std::make_unique<Worker>(i, cfg, streaming ? std::string() : out_parts.back(), late,
+                                               coord.get(), snap ? &*snap : nullptr, sink.get()));
   }
 
   std::vector<std::thread> threads;
@@ -794,28 +900,33 @@ PipelineResult run_pipeline(const Config& cfg) {
   if (!reader_error.empty()) result.error = "reader: " + reader_error;
   if (coord) result.checkpoints = coord->stats();
   workers.clear();  // closes any file a failed worker still holds
-  if (!result.error.empty()) return result;
+  if (!result.error.empty()) {
+    // Without a checkpoint the part files cannot be resumed from, so a
+    // failed run removes them instead of leaving <out>.part<i> behind. With
+    // --ckpt-dir they are the state a --resume truncates and continues.
+    if (!coord) {
+      std::error_code rm_ec;
+      for (const auto& p : out_parts) fs::remove(p, rm_ec);
+      for (const auto& p : late_parts) fs::remove(p, rm_ec);
+      if (!dir.empty()) fs::remove(dir, rm_ec);
+    }
+    return result;
+  }
 
   // Merge, in an order that survives a crash at any point (checkpoint.h):
   //   1. late file: tmp + rename        (idempotent: a resume redoes it)
   //   2. output:    tmp + rename        (the commit of the whole run)
-  //   3. delete the checkpoint directory (a later --resume starts over from
-  //      byte 0 and rewrites the same bytes; without it a stale MANIFEST
-  //      would point at part files we are about to delete)
+  //   3. delete the checkpoint directory, MANIFEST first (a later --resume
+  //      starts over from byte 0 and rewrites the same bytes; without it a
+  //      stale MANIFEST would point at part files we are about to delete)
   //   4. delete the part files
   if (!late_parts.empty()) {
     // Every part starts with the 8-byte .ads header; keep only the first.
     merge_atomic(late_parts, cfg.late_out_path, false, kFileHeaderSize);
   }
-  if (cfg.out_path == "-") {
-    write_csv_header(stdout);
-    concat_parts(out_parts, stdout, 0);
-    std::fflush(stdout);
-  } else {
-    merge_atomic(out_parts, cfg.out_path, true, 0);
-  }
+  if (!streaming) merge_atomic(out_parts, cfg.out_path, true, 0);
   std::error_code ec;
-  if (coord) fs::remove_all(cfg.ckpt_dir, ec);
+  if (coord) remove_checkpoint_dir(cfg.ckpt_dir, cfg.fsync);
   for (const auto& p : out_parts) fs::remove(p, ec);   // best effort; a leftover part is not an error
   for (const auto& p : late_parts) fs::remove(p, ec);
   if (!dir.empty()) fs::remove(dir, ec);

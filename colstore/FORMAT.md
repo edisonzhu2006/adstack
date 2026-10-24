@@ -1,4 +1,4 @@
-# .col file format, version 2
+# .col file format, version 3
 
 The on-disk format of colstore. `src/format.h` is the executable version of
 this document; if they disagree, the header wins and this file has a bug.
@@ -10,9 +10,21 @@ Version 2 (2026-10-21) differs from version 1 in one way: the footer
 carries the table's SCHEMA (column names and physical types), where
 version 1 hardcoded the ten `adstack::Event` fields. A `.col` file is now
 any table of integer columns; the two tables colstore writes are the event
-table and streamkit's aggregate table (both below). Version-1 files are
-refused by the reader (`unsupported .col version 1`) and must be
-re-ingested; nothing persistent depended on them.
+table and streamkit's aggregate table (both below).
+
+Version 3 (2026-10-24) adds checksums and changes no offset: every
+ChunkMeta's last field, a reserved zero in version 2, is now the CRC-32C
+of that chunk's bytes, and the footer's fourth field, also a reserved zero,
+is now the CRC-32C of the footer itself. Together with the header and
+trailer checks, every byte of the file is covered, so a single flipped bit
+anywhere is reported as corruption instead of being read as a different
+value (version 2 could not tell; NOTES.md, "Review fixes", has the case).
+Older files are refused by the reader (`unsupported .col version N`) and
+must be re-ingested; nothing persistent depended on them.
+
+CRC-32C here is the Castagnoli CRC with the usual conventions (reflected
+polynomial `0x82F63B78`, initial value and final xor `0xFFFFFFFF`; the
+CRC of the ASCII bytes `123456789` is `0xE3069283`), as in iSCSI and ext4.
 
 ## Overall layout
 
@@ -53,7 +65,7 @@ whole. There is no partial recovery; the ingest is re-run.
 | bytes | type   | value                          |
 |-------|--------|--------------------------------|
 | 0..3  | uint32 | `0x314C4F43` (`"COL1"` as LE)  |
-| 4..7  | uint32 | version, currently `2`         |
+| 4..7  | uint32 | version, currently `3`         |
 
 ## Row groups
 
@@ -132,8 +144,10 @@ section is padded to a whole byte. "width" below is bits per value.
 ### Encoding 0: PLAIN
 
 `rows * width` bytes: each value at its natural width, little-endian, in
-row order. Decoding is a single `memcpy`. The baseline every other
-encoding is measured against, and the fallback when nothing beats it.
+row order. Decoding into a typed array (`ColReader::read_column<T>`) is a
+single `memcpy`; decoding into the 64-bit view the query engine uses is one
+load-and-widen loop. The baseline every other encoding is measured
+against, and the fallback when nothing beats it.
 
 ### Encoding 1: DICT
 
@@ -142,8 +156,9 @@ For low-cardinality columns (`country`, `device`).
 ```
 uint32 n
 uint32 d                      dictionary size
-d values at natural width     distinct values, ascending in the column's
-                              natural order (signed for i64)
+d values at natural width     distinct values, strictly ascending in the
+                              column's natural order (signed for i64);
+                              a reader rejects a dictionary that is not
 uint8  code_width             bits needed for d-1; 0 when d <= 1
 ceil(n * code_width / 8)      bit-packed codes, code i indexes the dictionary
 ```
@@ -195,13 +210,18 @@ lengths each get their own width.
 
 ### Reader validation of chunks
 
-Decoders read through a bounds-checked cursor and reject a chunk if: the
-chunk's `n` differs from the footer's `rows`; any header is truncated; a
-`code_width` disagrees with `d`; a code is `>= d`; a run length is 0 or
-runs do not sum to exactly `n`; a bit width is above 64; a packed section
-is shorter than `n * width` bits; or bytes remain after the last section.
-Values decoded for a narrow column that do not fit its width are rejected
-too. A corrupt chunk therefore throws; it never reads outside the chunk.
+Before any decoder sees a chunk, the reader checks its CRC-32C against
+the footer's `crc32c`; a mismatch throws, naming the row group and column.
+The decoders then check structure, through a bounds-checked cursor, and
+reject a chunk if: the chunk's `n` differs from the footer's `rows`; any
+header is truncated; a `code_width` disagrees with `d`; a dictionary is
+not strictly ascending; a code is `>= d`; a run length is 0 or runs do not
+sum to exactly `n`; a bit width is above 64; a packed section is shorter
+than `n * width` bits; bytes remain after the last section; or a DELTA_BP
+value decoded for a u8/u16/u32 column does not fit its width. A decoder
+never reads outside the chunk. The checksum is what catches damage that
+leaves the structure valid (one flipped bit in a value); the structural
+checks are what catch a buggy writer, whose checksum would be "correct".
 
 ## Footer
 
@@ -209,7 +229,7 @@ too. A corrupt chunk therefore throws; it never reads outside the chunk.
 uint32 num_row_groups
 uint32 num_columns          (1 .. 4096)
 uint32 rows_per_group       (writer setting)
-uint32 reserved             (0)
+uint32 footer_crc32c        (CRC-32C of the whole footer with these 4 bytes read as 0)
 uint64 total_rows
 repeat num_columns times (the schema, in chunk order):
     uint32 type             (type id, table above)
@@ -238,7 +258,7 @@ per group) it is smaller still.
 | 24..31 | uint64 | `min_bits`   | minimum value, raw 8 bytes                         |
 | 32..39 | uint64 | `max_bits`   | maximum value, raw 8 bytes                         |
 | 40..43 | uint32 | `null_count` | reserved, always 0 (no table here has a nullable field) |
-| 44..47 | uint32 | `reserved`   | 0; keeps the record 8-byte aligned                 |
+| 44..47 | uint32 | `crc32c`     | CRC-32C of the chunk's `length` bytes (version 3)  |
 
 `min_bits` / `max_bits` hold the value's two's-complement bits widened to
 64 bits: sign-extended for `i64` columns, zero-extended for unsigned ones.
@@ -258,7 +278,8 @@ chunk's encoding.
 
 On open, the reader rejects the file if any of these fail: file shorter than
 20 bytes, header magic or version wrong, trailer magic wrong, footer length
-larger than the space between header and trailer, `num_columns` zero or
+larger than the space between header and trailer, the footer's CRC-32C
+(checked before any other footer field is trusted), `num_columns` zero or
 above 4096, a schema entry truncated, a name that is not an identifier or
 not unique, a type id above 4, footer length inconsistent with
 `num_row_groups` and `num_columns`, any chunk `rows` differing from its

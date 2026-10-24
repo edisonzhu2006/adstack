@@ -172,6 +172,25 @@ TEST(SqliteLoader, CsvHasHeaderThenRowsInColstoreShape) {
   EXPECT_EQ(text, "country,count\n356,500\n840,500\n");
 }
 
+TEST(SqliteLoader, CsvPrintsNullAsAnEmptyField) {
+  // SUM and MIN over zero rows are NULL in SQL; colstore prints a NULL cell
+  // as an empty field, so this side must too or the bench diff would hide
+  // the difference between NULL and 0.
+  LoadedDb loaded(100);
+  Db db(loaded.db.path(), Db::Mode::kReadOnly);
+  FILE* tmp = std::tmpfile();
+  ASSERT_NE(tmp, nullptr);
+  const Db::RunReport r = write_query_csv(
+      db, "SELECT COUNT(*) AS count, SUM(cost_micros) AS s, MIN(cost_micros) AS m FROM events WHERE country = 1", tmp);
+  EXPECT_EQ(r.rows, 1u);
+  std::rewind(tmp);
+  std::string text;
+  char buf[256];
+  while (std::fgets(buf, sizeof buf, tmp)) text += buf;
+  std::fclose(tmp);
+  EXPECT_EQ(text, "count,s,m\n0,,\n");
+}
+
 TEST(SqliteLoader, PlanUsesTheCoveringIndexForThePointCount) {
   LoadedDb loaded(2000);
   Db db(loaded.db.path(), Db::Mode::kReadOnly);

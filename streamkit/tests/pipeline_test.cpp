@@ -7,14 +7,20 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "common/agg.h"
 #include "common/event.h"
@@ -385,4 +391,171 @@ TEST(Pipeline, TornInputIsReportedNotHung) {
   EXPECT_NE(r.error.find("torn"), std::string::npos) << r.error;
   fs::remove(in);
   for (int i = 0; i < 3; ++i) fs::remove(cfg.out_path + ".part" + std::to_string(i));
+}
+
+// ---- review fixes (2026-10-24) -----------------------------------------------------
+
+namespace {
+
+void write_events(const std::string& path, const std::vector<Event>& events) {
+  EventWriter w(path);
+  for (const Event& e : events) w.write(e);
+  w.close();
+}
+
+}  // namespace
+
+TEST(Pipeline, ExtremeEventTimesFailLoudlyInsteadOfOverflowing) {
+  // One record near INT64_MIN used to hang the engine (window_start wrapped
+  // and for_each_window_start never terminated); one near INT64_MAX was
+  // silently diverted as late. Both were signed overflow, i.e. undefined
+  // behaviour. Now the record is rejected by name before any arithmetic.
+  // Run under the ASan+UBSan build this test must also print no UBSan report.
+  for (const int64_t t : {LLONG_MIN + 5, LLONG_MAX - 5, kMaxAbsEventTimeUs + 1, -kMaxAbsEventTimeUs - 1}) {
+    for (const int64_t lateness_s : {int64_t{0}, int64_t{60}}) {
+      const std::string in = scratch("extreme.ads");
+      write_events(in, {make(41, t, 7), make(42, 0, 7)});
+      Config cfg = base_config();
+      cfg.lateness_us = lateness_s * kS;
+      cfg.in_path = in;
+      cfg.out_path = scratch("extreme.csv");
+      cfg.threads = 2;
+      const PipelineResult r = run_pipeline(cfg);  // returns: no hang
+      EXPECT_NE(r.error.find("event_id 41"), std::string::npos) << t << ": " << r.error;
+      EXPECT_NE(r.error.find("outside the supported range"), std::string::npos) << r.error;
+      EXPECT_FALSE(fs::exists(cfg.out_path)) << "a failed run commits no output";
+      for (int i = 0; i < 2; ++i) {
+        // Without --ckpt-dir the parts are useless, so a failed run removes them.
+        EXPECT_FALSE(fs::exists(cfg.out_path + ".part" + std::to_string(i))) << "leftover part " << i;
+      }
+      fs::remove(in);
+    }
+  }
+}
+
+TEST(Pipeline, EventTimesAtTheSupportedLimitsAreAggregatedExactly) {
+  // The edge of the range must work, sliding windows included, with the
+  // largest durations the config accepts (no overflow anywhere in between).
+  for (const int64_t t : {-kMaxAbsEventTimeUs, kMaxAbsEventTimeUs}) {
+    Config cfg = base_config();
+    cfg.window_us = 300 * kS;
+    cfg.slide_us = 60 * kS;
+    cfg.lateness_us = kMaxDurationUs;
+    const auto rows = run_worker(cfg, {make(1, t, 3), make(2, t, 3), make(2, t, 3)});
+    ASSERT_EQ(rows.size(), 5u) << t;  // window / slide windows, each with 2 events (one dup)
+    for (const auto& [k, a] : rows) {
+      EXPECT_LE(k.window_start_us, t);
+      EXPECT_GT(k.window_start_us + cfg.window_us, t);
+      EXPECT_EQ(a.impressions, 2u);
+    }
+  }
+  Config big = base_config();
+  big.window_us = kMaxDurationUs + 1;
+  big.slide_us = big.window_us;
+  big.in_path = "/nonexistent";
+  EXPECT_THROW(run_pipeline(big), std::invalid_argument);
+}
+
+TEST(Worker, ExpiredLateEventsAreCountedSeparately) {
+  // Window 1 s, lateness 0: the dedup horizon is watermark - 1 s. A copy of
+  // an event that arrives after the horizon passed it cannot be recognised
+  // as a duplicate any more; it is diverted as late (the aggregates stay
+  // exact) but counted as expired, because the late file may now hold a
+  // re-delivery of an event that was already counted.
+  Config cfg = base_config();
+  cfg.window_us = kS;
+  cfg.slide_us = kS;
+  cfg.lateness_us = 0;
+  WorkerStats st;
+  const auto rows = run_worker(cfg,
+                               {make(1, 10 * kS + 500'000, 5),    // counted in [10, 11)
+                                make(2, 100 * kS, 5),             // watermark 100 s, horizon 99 s
+                                make(1, 10 * kS + 500'000, 5),    // re-delivery of 1: expired + late
+                                make(3, 50 * kS, 5),              // new but far too late: expired + late
+                                make(4, 99 * kS + 500'000, 5),    // late, inside the horizon: remembered
+                                make(4, 99 * kS + 500'000, 5)},   // ... so its copy is a dup
+                               &st);
+  EXPECT_EQ(st.late, 3u);
+  EXPECT_EQ(st.expired, 2u);
+  EXPECT_EQ(st.dups, 1u);
+  EXPECT_EQ(rows.at({10 * kS, 5}).impressions, 1u) << "the re-delivery is not counted twice";
+  EXPECT_EQ(rows.size(), 2u);
+}
+
+TEST(Pipeline, StdoutRowsAreVisibleBeforeEndOfInput) {
+  // --out - used to buffer every row in part files and print them after the
+  // last worker joined, so a consumer saw nothing until end of input while
+  // --latency-stats reported milliseconds. Now each batch's rows are
+  // written and flushed to stdout as soon as their windows close. Proof:
+  // feed a pipe, close a window, and wait for its row to appear on stdout
+  // while the pipe is still open.
+  const std::string out = scratch("stdout.csv");
+  int p[2];
+  ASSERT_EQ(::pipe(p), 0);
+  std::fflush(stdout);
+  const int saved_stdout = ::dup(STDOUT_FILENO);
+  const int out_fd = ::open(out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  ASSERT_GE(out_fd, 0);
+  ASSERT_GE(::dup2(out_fd, STDOUT_FILENO), 0);
+  ::close(out_fd);
+
+  auto count_rows = [&] {
+    std::ifstream f(out);
+    std::string line;
+    size_t n = 0;
+    while (std::getline(f, line)) ++n;
+    return n == 0 ? 0 : n - 1;  // minus the header
+  };
+  bool visible_before_eof = false;
+  std::thread producer([&] {
+    auto send = [&](const std::vector<Event>& evs) {
+      std::vector<uint8_t> buf;
+      for (const Event& e : evs) {
+        uint8_t rec[kEventWireSize];
+        encode(e, rec);
+        buf.insert(buf.end(), rec, rec + kEventWireSize);
+      }
+      (void)!::write(p[1], buf.data(), buf.size());
+    };
+    uint8_t hdr[kFileHeaderSize];
+    std::memcpy(hdr, &kFileMagic, 4);
+    std::memcpy(hdr + 4, &kFileVersion, 4);
+    (void)!::write(p[1], hdr, sizeof hdr);
+    // Window [0, 1 s) of campaigns 1..4; the event at 2.5 s closes it on
+    // whichever worker owns each campaign.
+    std::vector<Event> first;
+    for (uint32_t c = 1; c <= 4; ++c) first.push_back(make(c, 500'000, c));
+    for (uint32_t c = 1; c <= 4; ++c) first.push_back(make(100 + c, 2'500'000, c));
+    send(first);
+    for (int i = 0; i < 500 && !visible_before_eof; ++i) {  // up to 5 s
+      if (count_rows() >= 4) visible_before_eof = true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    send({make(200, 2'700'000, 1)});  // same window as 101: closes nothing new
+    ::close(p[1]);
+  });
+
+  Config cfg = base_config();
+  cfg.window_us = kS;
+  cfg.slide_us = kS;
+  cfg.lateness_us = 0;
+  cfg.in_path = "/dev/fd/" + std::to_string(p[0]);
+  cfg.out_path = "-";
+  cfg.threads = 2;
+  cfg.latency_stats = true;
+  PipelineResult r = run_pipeline(cfg);
+  producer.join();
+  std::fflush(stdout);
+  ::dup2(saved_stdout, STDOUT_FILENO);
+  ::close(saved_stdout);
+  ::close(p[0]);
+
+  ASSERT_TRUE(r.error.empty()) << r.error;
+  EXPECT_TRUE(visible_before_eof) << "rows only appeared at end of input";
+  EXPECT_EQ(r.emit_latency_us.size(), 4u) << "one sample per watermark-closed window";
+  auto rows = read_csv(out);
+  EXPECT_EQ(rows.size(), 8u);  // [0,1) and [2,3) for campaigns 1..4
+  for (uint32_t c = 1; c <= 4; ++c) EXPECT_EQ(rows.at({0, c}).impressions, 1u);
+  EXPECT_EQ(rows.at({2 * kS, 1}).impressions, 2u);
+  fs::remove(out);
 }

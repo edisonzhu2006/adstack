@@ -28,8 +28,11 @@
 //
 // THE STRUCTURE. Ids live in hash sets bucketed by event_time (default 1s
 // buckets). Forgetting is "drop whole buckets whose range lies below H
-// rounded down to a bucket boundary", which is O(1) per bucket instead of a
-// per-id sweep. Because the watermark only moves forward, the set of buckets
+// rounded down to a bucket boundary". That is O(1) bookkeeping per bucket
+// (one deque pop), but clearing the bucket's hash set still frees each of its
+// nodes, so the work per forgotten id is one free, the same as per-id expiry.
+// What bucketing saves is the ordered structure per-id expiry would maintain
+// on every insert (a heap or map keyed by event_time). Because the watermark only moves forward, the set of buckets
 // is a sliding span of at most (lateness + window) / bucket + 2 buckets, so
 // memory is proportional to the event rate times (lateness + window), not
 // to the stream length. See streamkit/NOTES.md for the alternatives that

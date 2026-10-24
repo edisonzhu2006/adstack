@@ -15,17 +15,22 @@
 #               events, 1 and 8 threads, plus 8 threads with --queue-depth 256
 #               to separate engine state from queue buffers
 #   latency     emit latency under paced replay: gen --pace at 200K events/s
-#               for 20 s piped into streamkit --window-s 1 --lateness-s 2
-#               --latency-stats, 1 and 8 threads; p50/p99 per run and the
-#               median over runs. The metric is defined in streamkit/latency.h
-#               and NOTES.md (m5): per window closed by the watermark, wall
-#               time from read(2) returning the block holding the closing
-#               event to the row being appended. It excludes the configured
-#               lateness and the producer's own buffering.
+#               for 20 s piped into streamkit --out - --window-s 1
+#               --lateness-s 2 --latency-stats, its stdout piped into cat,
+#               1 and 8 threads; p50/p99 per run and the median over runs.
+#               The metric is defined in streamkit/latency.h and NOTES.md
+#               (m5, as revised in "Review fixes"): per window closed by the
+#               watermark, wall time from read(2) returning the block holding
+#               the closing event to the row having been written to stdout,
+#               i.e. into the pipe a consumer reads. It excludes the
+#               configured lateness and the producer's own buffering.
 #
 # Every cell is the median of three runs (the middle value); the three runs
 # are printed too, so the spread is visible. Inputs are generated once and
-# cached in /private/tmp/adstack-sk (about 1.1 GB for the 10M-event files).
+# cached in $ADSTACK_CACHE (default /private/tmp/adstack-sk; about 1.1 GB for
+# the 10M-event files); outputs, checkpoints and logs go to a private
+# mktemp directory under it, so concurrent runs do not share or delete each
+# other's files.
 # Any extra arguments are passed through to every streamkit invocation, which
 # is how the variants in NOTES.md were measured (e.g. --reader-decode).
 #
@@ -37,7 +42,7 @@ ONLY="threads,dedup,checkpoint,memory,latency"
 if [ "${1:-}" = "--only" ]; then ONLY=$2; shift 2; fi
 EXTRA=("$@")
 
-CACHE=/private/tmp/adstack-sk
+CACHE=${ADSTACK_CACHE:-/private/tmp/adstack-sk}
 N=10000000
 SEED=1
 RUNS=3
@@ -48,10 +53,11 @@ mkdir -p "$CACHE"
 IN="$CACHE/ev${N}_seed${SEED}.ads"
 IN_CLEAN="$CACHE/ev${N}_seed${SEED}_clean.ads"
 IN_1M="$CACHE/ev1000000_seed${SEED}.ads"
-OUT="$CACHE/throughput_out.csv"
-CKPT="$CACHE/throughput_ckpt"
-LOG="$CACHE/throughput_run.log"
-trap 'rm -f "$OUT" "$OUT".part* "$OUT.tmp" "$LOG" "$LOG.gen"; rm -rf "$CKPT"' EXIT
+WORK=$(mktemp -d "$CACHE/throughput.XXXXXX")
+OUT="$WORK/out.csv"
+CKPT="$WORK/ckpt"
+LOG="$WORK/run.log"
+trap 'rm -rf "$WORK"' EXIT
 
 want() { case ",$ONLY," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
@@ -81,11 +87,13 @@ lat_run() {  # $1 = threads
   for attempt in 1 2; do
     set +e
     "$B/bin/gen" --n $((LAT_RATE * LAT_SECS)) --rate "$LAT_RATE" --pace --seed "$SEED" --out - 2>"$LOG.gen" \
-      | sk --in - --out "$OUT" --window-s 1 --lateness-s 2 --threads "$1" --latency-stats
+      | "$B/bin/streamkit" --in - --out - --window-s 1 --lateness-s 2 --threads "$1" --latency-stats \
+          ${EXTRA[@]+"${EXTRA[@]}"} 2>"$LOG" \
+      | cat > /dev/null
     st=("${PIPESTATUS[@]}")
     set -e
-    if [ "${st[0]}" -eq 0 ] && [ "${st[1]}" -eq 0 ]; then return 0; fi
-    echo "latency run (threads $1, attempt $attempt) failed: gen exit ${st[0]}, streamkit exit ${st[1]}" >&2
+    if [ "${st[0]}" -eq 0 ] && [ "${st[1]}" -eq 0 ] && [ "${st[2]}" -eq 0 ]; then return 0; fi
+    echo "latency run (threads $1, attempt $attempt) failed: gen exit ${st[0]}, streamkit exit ${st[1]}, cat exit ${st[2]}" >&2
     echo "--- gen stderr ---" >&2; cat "$LOG.gen" >&2
     echo "--- streamkit stderr ---" >&2; cat "$LOG" >&2
   done
@@ -107,9 +115,17 @@ header() {
 
 # ---- inputs -------------------------------------------------------------------------
 
-[ -s "$IN" ]       || "$B/bin/gen" --n "$N" --seed "$SEED" --out "$IN"
-[ -s "$IN_CLEAN" ] || "$B/bin/gen" --n "$N" --seed "$SEED" --dup-frac 0 --out "$IN_CLEAN"
-[ -s "$IN_1M" ]    || "$B/bin/gen" --n 1000000 --seed "$SEED" --out "$IN_1M"
+# Generated to a private name and renamed, so a concurrent run never reads a
+# half-written input (the rename is atomic; both writers produce the same
+# bytes, so whichever lands last is fine).
+gen_once() {  # $1 = path, rest = gen flags
+  local f=$1; shift
+  [ -s "$f" ] && return 0
+  "$B/bin/gen" "$@" --out "$f.tmp.$$" && mv -f "$f.tmp.$$" "$f"
+}
+gen_once "$IN"       --n "$N" --seed "$SEED"
+gen_once "$IN_CLEAN" --n "$N" --seed "$SEED" --dup-frac 0
+gen_once "$IN_1M"    --n 1000000 --seed "$SEED"
 
 echo "# streamkit benchmarks"
 echo
@@ -254,9 +270,9 @@ fi
 if want latency; then
   echo "## emit latency under paced replay"
   echo
-  echo "- command: gen --n $((LAT_RATE * LAT_SECS)) --rate $LAT_RATE --pace --seed $SEED --out - | streamkit --in - --out \$OUT --window-s 1 --lateness-s 2 --threads P --latency-stats"
-  echo "- metric (latency.h, NOTES.md m5): per window closed by the watermark, wall time from read(2) returning the block that holds the event which pushed this worker's watermark past the window's end, to that window's row being appended to the worker's output stream; nearest-rank percentiles over all such windows; windows closed by end of input are not counted"
-  echo "- not included: the 2 s of allowed lateness (event-time), gen's own 1 MiB output buffering before the bytes reach the pipe, stdio flush of the row to disk, the final merge"
+  echo "- command: gen --n $((LAT_RATE * LAT_SECS)) --rate $LAT_RATE --pace --seed $SEED --out - | streamkit --in - --out - --window-s 1 --lateness-s 2 --threads P --latency-stats | cat > /dev/null"
+  echo "- metric (latency.h, NOTES.md m5 and Review fixes): per window closed by the watermark, wall time from read(2) returning the block that holds the event which pushed this worker's watermark past the window's end, to that window's row having been written (fwrite + fflush) to stdout, a pipe read by cat; nearest-rank percentiles over all such windows; windows closed by end of input are not counted"
+  echo "- not included: the 2 s of allowed lateness (event-time), gen's own 1 MiB output buffering before the bytes reach the pipe, the consumer's own read"
   echo "- achieved rate = events / wall as reported by streamkit; input reads = read(2) calls that returned data, i.e. how many arrivals the stamps are taken at"
   echo
   echo "| threads | run | achieved events/s | watermark-closed windows | input reads (events/read) | min us | p50 us | p99 us | max us |"

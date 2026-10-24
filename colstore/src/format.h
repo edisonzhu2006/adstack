@@ -12,7 +12,8 @@
 //   ...
 //   [footer]      the schema (column names and types), then per-row-group,
 //                 per-column ChunkMeta (offset, length, rows, encoding,
-//                 min, max, null count)
+//                 min, max, null count, CRC-32C of the chunk's bytes); the
+//                 footer carries a CRC-32C of itself (version 3)
 //   [trailer]     12 bytes: uint64 footer length + magic "COL1"
 //
 // The footer goes at the END so the writer is single-pass: it does not know
@@ -49,7 +50,11 @@ namespace colstore {
 // ---- constants ------------------------------------------------------------
 
 constexpr uint32_t kColMagic = 0x314C4F43;  // "COL1" read as little-endian
-constexpr uint32_t kColVersion = 2;         // 1 = fixed Event columns, no schema in the footer
+// 1 = fixed Event columns, no schema in the footer; 2 = schema in the
+// footer; 3 = CRC-32C per chunk and of the footer (the two fields were
+// reserved zeros in v2, so the layout is unchanged but a v2 file would fail
+// every check, hence the bump).
+constexpr uint32_t kColVersion = 3;
 constexpr size_t kHeaderSize = 8;           // magic + version
 constexpr size_t kTrailerSize = 12;         // uint64 footer length + uint32 magic
 constexpr uint32_t kDefaultRowsPerGroup = 65'536;
@@ -72,7 +77,7 @@ enum class Encoding : uint32_t {
   Plain = 0,    // values at natural width, in row order (memcpy)
   Dict = 1,     // sorted dictionary + bit-packed codes (low cardinality)
   DeltaBp = 2,  // blocks of 128: first value, min delta, bit-packed deltas (near-monotone ints)
-  RleDict = 3,  // dictionary + bit-packed (code, run length) pairs (long runs)
+  RleDict = 3,  // dictionary + run codes and run lengths as two bit-packed arrays (long runs)
 };
 constexpr uint32_t kNumEncodings = 4;
 
@@ -140,8 +145,8 @@ struct ChunkMeta {
   uint32_t encoding = 0;    // Encoding
   uint64_t min_bits = 0;    // raw 8 bytes; signed columns are sign-extended
   uint64_t max_bits = 0;    //   (compare with is_signed(column type))
-  uint32_t null_count = 0;  // reserved, always 0 in v1/v2: no table here has a nullable field
-  uint32_t reserved = 0;    // keeps the record 8-byte aligned; must be 0
+  uint32_t null_count = 0;  // reserved, always 0: no table here has a nullable field
+  uint32_t crc32c = 0;      // CRC-32C of the chunk's `length` bytes (crc32c.h); checked on every read
 
   bool operator==(const ChunkMeta&) const = default;
 };
@@ -165,7 +170,7 @@ struct Footer {
 
 // Footer body wire layout (no trailer):
 //   uint32 num_row_groups, uint32 num_columns, uint32 rows_per_group,
-//   uint32 reserved, uint64 total_rows,
+//   uint32 footer_crc32c, uint64 total_rows,
 //   then per column: uint32 type, uint32 name_len, name bytes (no NUL),
 //   then per row group: uint32 rows, then num_columns ChunkMeta records.
 constexpr size_t kFooterFixedSize = 4 + 4 + 4 + 4 + 8;
@@ -175,10 +180,19 @@ inline size_t footer_wire_size(const Footer& f) {
   return kFooterFixedSize + schema_wire_size(f.columns) + f.row_groups.size() * row_group_meta_wire_size(f.columns.size());
 }
 
+// footer_crc32c is the CRC-32C of the whole footer body computed with its
+// own four bytes (offset kFooterCrcOffset) taken as zero.
+constexpr size_t kFooterCrcOffset = 12;
+
 // Throws std::invalid_argument if f.columns is not a valid schema.
 std::vector<uint8_t> encode_footer(const Footer& f);
-// Throws std::runtime_error on a truncated or inconsistent footer.
+// Throws std::runtime_error on a checksum mismatch or a truncated or
+// inconsistent footer. The checksum is checked first, so any corruption of
+// the footer is reported as such.
 Footer decode_footer(const uint8_t* data, size_t len);
+// Recomputes and stores the footer checksum of an encoded footer body; for
+// tests that patch a field on purpose to reach the checks behind it.
+void reseal_footer(std::vector<uint8_t>& body);
 
 // Signed/unsigned view of the raw min/max bits.
 int64_t as_signed(uint64_t bits);

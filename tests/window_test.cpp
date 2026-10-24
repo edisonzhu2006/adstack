@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "common/agg.h"
@@ -106,4 +108,59 @@ TEST(Sliding, EveryWindowIsExactlyTheSetOfEventsItContains) {
       EXPECT_EQ(contains, listed) << "t=" << t << " s=" << s;
     }
   }
+}
+
+// ---- review fixes (2026-10-24): supported ranges and checked sums ------------
+
+TEST(Range, SupportedEventTimesAreExactlyPlusMinusTwoToThe62) {
+  EXPECT_TRUE(event_time_supported(0));
+  EXPECT_TRUE(event_time_supported(kMaxAbsEventTimeUs));
+  EXPECT_TRUE(event_time_supported(-kMaxAbsEventTimeUs));
+  EXPECT_FALSE(event_time_supported(kMaxAbsEventTimeUs + 1));
+  EXPECT_FALSE(event_time_supported(-kMaxAbsEventTimeUs - 1));
+  EXPECT_FALSE(event_time_supported(INT64_MIN + 5));
+  EXPECT_FALSE(event_time_supported(INT64_MAX - 5));
+  Event e;
+  e.event_id = 9;
+  e.event_time_us = INT64_MIN + 5;
+  EXPECT_THROW(check_event_time(e), std::out_of_range);
+  e.event_time_us = 1'767'225'600'000'000LL;
+  EXPECT_NO_THROW(check_event_time(e));
+}
+
+TEST(Range, WindowEnumerationAtTheLimitsTerminatesWithoutOverflow) {
+  // Before the fix, t = INT64_MIN + 5 made window_start wrap positive and
+  // this loop never ended. At the supported limits, with the largest
+  // durations, every start is still exact (run under UBSan to see no report).
+  const int64_t slide = kMaxDurationUs / 4;
+  for (const int64_t t : {-kMaxAbsEventTimeUs, kMaxAbsEventTimeUs, int64_t{0}}) {
+    const auto starts = window_starts(t, kMaxDurationUs, slide);
+    ASSERT_EQ(starts.size(), 4u) << t;
+    for (size_t i = 0; i < starts.size(); ++i) {
+      EXPECT_LE(starts[i], t);
+      EXPECT_GT(starts[i] + kMaxDurationUs, t);
+      if (i > 0) EXPECT_EQ(starts[i] - starts[i - 1], slide);
+    }
+  }
+}
+
+TEST(Agg, CostSumOverflowThrowsInsteadOfWrapping) {
+  // Two events of INT64_MAX micro-dollars used to print a cost of -2.
+  Agg a;
+  Event e;
+  e.event_type = 0;
+  e.cost_micros = INT64_MAX;
+  a.add(e);
+  EXPECT_EQ(a.cost_micros, INT64_MAX);
+  EXPECT_THROW(a.add(e), std::overflow_error);
+  Agg b;
+  e.cost_micros = INT64_MIN;
+  b.add(e);
+  EXPECT_THROW(b.add(e), std::overflow_error);
+  Agg c;  // ordinary negative and positive costs still add exactly
+  e.cost_micros = -5;
+  c.add(e);
+  e.cost_micros = 7;
+  c.add(e);
+  EXPECT_EQ(c.cost_micros, 2);
 }

@@ -35,9 +35,12 @@
 //              ceil(r * code_width / 8) bytes of packed run codes,
 //              ceil(r * len_width / 8) bytes of packed run lengths.
 //
-// Decoders validate everything they read (counts, code range, run length
-// sum, remaining bytes) and throw std::runtime_error on a corrupt chunk;
-// they never read outside [data, data + len).
+// Decoders validate the structure of everything they read (counts, code
+// width and range, dictionary order, run length sum, value width for
+// DELTA_BP, remaining bytes) and throw std::runtime_error on a corrupt
+// chunk; they never read outside [data, data + len). A corruption that
+// leaves the structure valid (one flipped bit in a value) is invisible to
+// them; that is what the per-chunk CRC-32C checked by ColReader is for.
 
 #include <algorithm>
 #include <cstdint>
@@ -177,7 +180,10 @@ Dictionary decode_rle_dict_parts(const uint8_t* data, size_t len, uint32_t rows,
 constexpr size_t kDeltaBlock = 128;  // values per block; one bit width per block
 
 size_t encode_delta_bp(const uint64_t* values, size_t n, std::vector<uint8_t>& out);
-std::vector<uint64_t> decode_delta_bp(const uint8_t* data, size_t len, uint32_t rows);
+// `type` only bounds the result: for a u8/u16/u32 column a decoded value
+// with bits above the column's width throws (corrupt chunk).
+std::vector<uint64_t> decode_delta_bp(const uint8_t* data, size_t len, uint32_t rows,
+                                      ColumnType type = ColumnType::U64);
 
 // ---- selection and dispatch ----------------------------------------------------
 
@@ -208,8 +214,8 @@ Encoding encode_smallest(const uint64_t* values, size_t n, ColumnType type,
                          std::vector<uint8_t>& out, CandidateSizes* sizes = nullptr);
 
 // Decodes a chunk of any encoding to 64-bit patterns. PLAIN goes through
-// here too (widened), for callers that do not know the column type at
-// compile time (dump, tests).
+// here too (one typed widen loop, widen_bytes), for callers that pick the
+// column at run time: the query Scanner, verify, dump and the tests.
 std::vector<uint64_t> decode_chunk(Encoding enc, const uint8_t* data, size_t len, uint32_t rows,
                                    ColumnType type);
 

@@ -234,6 +234,106 @@ TEST_F(QueryFiles, CsvOutput) {
   EXPECT_EQ(text, "device,count,lo\n0,17,-1000\n1,17,-997\n");
 }
 
+std::string csv_text(const QueryResult& r) {
+  FILE* f = std::tmpfile();
+  EXPECT_NE(f, nullptr);
+  write_csv(f, r);
+  std::rewind(f);
+  char buf[256];
+  std::string text;
+  while (std::fgets(buf, sizeof buf, f)) text += buf;
+  std::fclose(f);
+  return text;
+}
+
+TEST_F(QueryFiles, GlobalAggregateOverZeroRowsIsOneRowWithNulls) {
+  // SQL: SELECT COUNT(*), SUM(x), MIN(x) ... WHERE <nothing matches> is one
+  // row (0, NULL, NULL), not zero rows. country=1 occurs in no row.
+  for (unsigned threads : {1u, 2u, 17u}) {
+    const QueryPlan p = plan("country=1", {}, "count(), sum(cost_micros), min(cost_micros), max(cost_micros), "
+                             "count_if(event_type=1), sum_if(cost_micros, event_type=1)", "", 0, threads);
+    const QueryResult r = run_aggregate_query(col_.path(), p);
+    ASSERT_EQ(r.table.rows(), 1u) << threads;
+    EXPECT_EQ(r.rows, (std::vector<uint32_t>{0}));
+    EXPECT_FALSE(r.table.is_null(0, 0));
+    EXPECT_EQ(r.table.at(0, 0), 0u);  // count
+    EXPECT_TRUE(r.table.is_null(1, 0));
+    EXPECT_TRUE(r.table.is_null(2, 0));
+    EXPECT_TRUE(r.table.is_null(3, 0));
+    EXPECT_FALSE(r.table.is_null(4, 0));
+    EXPECT_EQ(r.table.at(4, 0), 0u);  // count_if
+    EXPECT_TRUE(r.table.is_null(5, 0));
+    EXPECT_EQ(csv_text(r), "count,sum_cost_micros,min_cost_micros,max_cost_micros,count_if_event_type_eq_1,"
+                           "sum_if_cost_micros_event_type_eq_1\n0,,,,0,\n");
+    const CheckReport c = check_against_ads(ads_.path(), p, r);
+    EXPECT_TRUE(c.ok) << c.detail;
+  }
+  // The same query with a LIMIT goes through the ordered comparison too.
+  const QueryPlan limited = plan("country=1", {}, "count(), sum(cost_micros)", "", 5);
+  const QueryResult rl = run_aggregate_query(col_.path(), limited);
+  const CheckReport cl = check_against_ads(ads_.path(), limited, rl);
+  EXPECT_TRUE(cl.ok) << cl.detail;
+}
+
+TEST_F(QueryFiles, CheckRejectsAMissingOrWrongEmptyGlobalRow) {
+  const QueryPlan p = plan("country=1", {}, "count(), sum(cost_micros)");
+  const QueryResult r = run_aggregate_query(col_.path(), p);
+  ASSERT_TRUE(check_against_ads(ads_.path(), p, r).ok);
+  // The old engine behaviour (zero rows) must now fail the check.
+  QueryResult no_row = r;
+  for (auto& col : no_row.table.cols) col.clear();
+  no_row.table.nulls.clear();
+  no_row.rows.clear();
+  EXPECT_FALSE(check_against_ads(ads_.path(), p, no_row).ok);
+  // SUM reported as 0 instead of NULL must fail too.
+  QueryResult zero_sum = r;
+  zero_sum.table.nulls.clear();
+  EXPECT_FALSE(check_against_ads(ads_.path(), p, zero_sum).ok);
+  // A NULL where a group saw rows must fail.
+  const QueryPlan some = plan("country=840", {}, "count(), sum(cost_micros)");
+  QueryResult r2 = run_aggregate_query(col_.path(), some);
+  ASSERT_TRUE(check_against_ads(ads_.path(), some, r2).ok);
+  EXPECT_FALSE(r2.table.is_null(1, 0));
+  r2.table.nulls.assign(r2.table.schema.size(), std::vector<uint8_t>(1, 0));
+  r2.table.nulls[1][0] = 1;
+  r2.table.cols[1][0] = 0;
+  EXPECT_FALSE(check_against_ads(ads_.path(), some, r2).ok);
+}
+
+TEST_F(QueryFiles, GlobalAggregateSkipsTheHashTableAndMatchesBruteForce) {
+  const QueryPlan p = plan("event_type=1", {}, "count(), sum(cost_micros), count_if(country=840)");
+  const QueryResult r = run_aggregate_query(col_.path(), p);
+  ASSERT_EQ(r.table.rows(), 1u);
+  EXPECT_TRUE(r.table.nulls.empty());
+  expect_matches_brute(r, p);
+  EXPECT_TRUE(check_against_ads(ads_.path(), p, r).ok);
+  // One probe in total: creating group 0. Rows are not hashed.
+  EXPECT_EQ(r.agg.probes, 1u);
+  EXPECT_GT(r.agg.rows, 0u);
+}
+
+TEST_F(QueryFiles, GroupByOverZeroRowsIsStillZeroRows) {
+  const QueryPlan p = plan("country=1", {ColumnId::CampaignId}, "count(), sum(cost_micros)", "count desc", 3);
+  const QueryResult r = run_aggregate_query(col_.path(), p);
+  EXPECT_EQ(r.table.rows(), 0u);
+  EXPECT_EQ(csv_text(r), "campaign_id,count,sum_cost_micros\n");
+  const CheckReport c = check_against_ads(ads_.path(), p, r);
+  EXPECT_TRUE(c.ok) << c.detail;
+}
+
+TEST_F(QueryFiles, GroupKeyFitDoesNotDependOnColumnOrder) {
+  // 32 + 64 + 32 bits: fits in 128 whichever order the columns are named.
+  for (const std::vector<ColumnId>& g : {std::vector<ColumnId>{ColumnId::CampaignId, ColumnId::EventId, ColumnId::AdvertiserId},
+                                         std::vector<ColumnId>{ColumnId::EventId, ColumnId::CampaignId, ColumnId::AdvertiserId},
+                                         std::vector<ColumnId>{ColumnId::AdvertiserId, ColumnId::CampaignId, ColumnId::EventId}}) {
+    const QueryPlan p = plan("event_type=2", g, "count()", "count desc", 5);
+    const QueryResult r = run_aggregate_query(col_.path(), p);
+    EXPECT_EQ(r.table.schema[0].name, spec_of(event_schema(), g[0]).name) << "output keeps the order given";
+    const CheckReport c = check_against_ads(ads_.path(), p, r);
+    EXPECT_TRUE(c.ok) << c.detail;
+  }
+}
+
 TEST_F(QueryFiles, BadPlansAreRejected) {
   QueryPlan p = plan("", {ColumnId::CampaignId}, "count()");
   p.threads = 0;

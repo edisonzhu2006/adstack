@@ -37,6 +37,16 @@ Footer synthetic_footer(const Schema& schema = event_schema()) {
   return f;
 }
 
+template <typename F>
+void expect_throw_containing(F f, const std::string& needle) {
+  try {
+    f();
+    ADD_FAILURE() << "no exception, expected one containing '" << needle << "'";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find(needle), std::string::npos) << e.what();
+  }
+}
+
 }  // namespace
 
 TEST(Footer, EncodeDecodeRoundTrip) {
@@ -83,10 +93,16 @@ TEST(Footer, RejectsTruncatedAndInconsistent) {
   EXPECT_THROW(decode_footer(bytes.data(), kFooterFixedSize - 1), std::runtime_error);
   EXPECT_THROW(decode_footer(bytes.data(), kFooterFixedSize + 3), std::runtime_error);  // inside the schema
 
-  // Corrupt total_rows (bytes 16..23) and expect the consistency check to fire.
+  // Corrupt total_rows (bytes 16..23): the checksum fires first; resealed
+  // (as if the writer itself had written the wrong count), the consistency
+  // check behind it fires.
   bytes[16] ^= 0x01;
-  EXPECT_THROW(decode_footer(bytes.data(), bytes.size()), std::runtime_error);
+  expect_throw_containing([&] { decode_footer(bytes.data(), bytes.size()); }, "checksum");
+  reseal_footer(bytes);
+  expect_throw_containing([&] { decode_footer(bytes.data(), bytes.size()); }, "total_rows");
   bytes[16] ^= 0x01;
+  reseal_footer(bytes);
+  EXPECT_EQ(decode_footer(bytes.data(), bytes.size()), f);
 
   // A row group whose chunk list does not match the schema cannot be encoded.
   Footer short_group = f;
@@ -110,7 +126,17 @@ TEST(Footer, RejectsBadSchemas) {
   // The same rules on the way in: patch a decoded footer's type byte.
   std::vector<uint8_t> bytes = encode_footer(with({{"a", ColumnType::U8}}));
   bytes[kFooterFixedSize] = 99;  // the first column's type
-  EXPECT_THROW(decode_footer(bytes.data(), bytes.size()), std::runtime_error);
+  reseal_footer(bytes);           // reach the schema check, not the checksum
+  expect_throw_containing([&] { decode_footer(bytes.data(), bytes.size()); }, "bad type");
+}
+
+TEST(Footer, ChecksumCoversEveryByte) {
+  const std::vector<uint8_t> bytes = encode_footer(synthetic_footer());
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    std::vector<uint8_t> copy = bytes;
+    copy[i] ^= static_cast<uint8_t>(1u << (i % 8));
+    EXPECT_THROW(decode_footer(copy.data(), copy.size()), std::runtime_error) << "byte " << i;
+  }
 }
 
 TEST(Schema, LookupsAndIndices) {

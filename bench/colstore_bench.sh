@@ -23,15 +23,23 @@
 # m4: the three benchmark queries (Q1 point filter + count, Q2 time-range
 # GROUP BY, Q3 full GROUP BY with conditional aggregates), each recomputed
 # from the .ads file with `q --check` first, then timed (3 runs, median)
-# at 1 / 2 / 4 / 8 threads; sort cost of ORDER BY with and without LIMIT;
-# batch size with the aggregate attached; a cold-cache run when `sudo -n
-# purge` is available (it is not without a password, and then it says so).
+# at 1 / 2 / 4 / 8 threads; where Q3's time goes (decode of the same
+# columns, then count() and Q3's four aggregates grouped by no column and
+# by columns with 2, 10, ~10K and 100K distinct values); sort cost of ORDER
+# BY with and without LIMIT; batch size with the aggregate attached; a
+# cold-cache run when `sudo -n purge` is available (it is not without a
+# password, and then it says so).
 # m5: the same rows loaded into SQLite by build/bin/colstore_sqlite (one
 # rowid table, indexes on (event_time_us), (country, event_type),
 # (campaign_id), ANALYZE; PRAGMAs printed), load time (3 runs, median) for
 # both engines, storage sizes, Q1-Q3 on both (3 runs, median; SQLite with
 # the planner's plan and with NOT INDEXED, the better one counts), the
-# answers diffed, the zone-map skip ratio for Q2, and markdown tables.
+# answers diffed (Q1-Q3 plus two edge cases where nothing matches: a global
+# aggregate, which must be one row with NULL sums, and a GROUP BY, which
+# must be no rows), the zone-map skip ratio for Q2, and markdown tables.
+#
+# Every stage prints the load average when it starts, because this machine
+# is shared and the load is the first thing to check when a number moves.
 # Skipped with a message when colstore_sqlite was not built (no sqlite3).
 set -euo pipefail
 B=${1:-build}
@@ -53,7 +61,20 @@ echo "== machine"
 echo "cpu:   $(sysctl -n machdep.cpu.brand_string 2>/dev/null || grep -m1 'model name' /proc/cpuinfo | cut -d: -f2)"
 echo "cores: $(sysctl -n hw.ncpu 2>/dev/null || nproc)"
 echo "os:    $(uname -sr)"
+# Apple silicon reports its core tiers as perflevels; this M5 Pro has two
+# tiers of performance cores with different L2 sizes and no efficiency
+# cores. macOS gives a user process no way to pick a tier, so the tier a
+# run landed on is not recorded (and cannot be from user space); the
+# commands run at the default QoS.
+for lvl in 0 1; do
+  name=$(sysctl -n "hw.perflevel$lvl.name" 2>/dev/null || true)
+  [ -n "$name" ] && echo "tier $lvl: $name, $(sysctl -n "hw.perflevel$lvl.physicalcpu") cores," \
+    "L2 $(( $(sysctl -n "hw.perflevel$lvl.l2cachesize") / 1048576 )) MiB per $(sysctl -n "hw.perflevel$lvl.cpusperl2") cores," \
+    "L1d $(( $(sysctl -n "hw.perflevel$lvl.l1dcachesize") / 1024 )) KiB"
+done
 echo "build: $B"
+load() { echo "load: $(uptime | sed 's/.*load averages*: *//')  ($1)"; }
+load "start"
 
 # 8-byte header + 52 bytes per event (common/event.h); a file of the wrong
 # size is a different N or a torn write, and is regenerated.
@@ -66,6 +87,7 @@ fi
 
 if [ "$STAGE" != "m5" ]; then
 
+load "m1/m2"
 echo "== ingest --encoding plain (3 runs; take the best)"
 for i in 1 2 3; do
   "$B/bin/colstore" ingest --in "$ADS" --out "$COL_PLAIN" --encoding plain 2>&1 | head -1
@@ -108,6 +130,7 @@ P3="event_type=1 AND cost_micros >= 1000"
 P4="campaign_id BETWEEN 50000 AND 50100"
 COLS=campaign_id,cost_micros
 
+load "m3"
 echo "== m3 verify: scan vs brute force over .ads (rows and column sums must match)"
 for P in "$P1" "$P2" "$P3" "$P4"; do
   echo "-- where $P"
@@ -161,6 +184,7 @@ Q2W="event_time_us BETWEEN $T0 AND $((T0 + 3600000000))"; Q2G=campaign_id; Q2A="
 Q3G=campaign_id
 Q3A="count_if(event_type=0) AS impressions,count_if(event_type=1) AS clicks,count_if(event_type=2) AS conversions,sum(cost_micros) AS cost_micros"
 
+load "m4"
 echo "== m4 check: each query recomputed from .ads with a std::map and diffed (threads 1, then 8 with ORDER BY / LIMIT)"
 "$B/bin/colstore" q --in "$COL" --where "$Q1W" --agg "$Q1A" --check "$ADS" 2>&1 >/dev/null | sed 's/^/Q1 /'
 "$B/bin/colstore" q --in "$COL" --where "$Q2W" --group "$Q2G" --agg "$Q2A" --check "$ADS" 2>&1 >/dev/null | sed 's/^/Q2 /'
@@ -191,6 +215,26 @@ echo "-- Q3 stats at threads=1 (groups, table, probes per row)"
 "$B/bin/colstore" q --in "$COL" --group "$Q3G" --agg "$Q3A" --stats 2>&1 >/dev/null | grep -E "^aggregate|^output"
 echo "-- Q2 stats at threads=1"
 "$B/bin/colstore" q --in "$COL" --where "$Q2W" --group "$Q2G" --agg "$Q2A" --stats 2>&1 >/dev/null | grep -E "row groups|^aggregate|^output"
+
+# Where Q3's time goes, with matched baselines: for each grouping, the
+# decode of exactly the columns that query reads, then count() (decode of
+# the group column + key pack + table probe + loop) and Q3's four
+# aggregates (which add event_type and cost_micros). Group columns by
+# distinct values: none (global aggregate, no hash table), device 2,
+# country 10, advertiser_id ~10K, campaign_id 100K. The arithmetic is in
+# colstore/NOTES.md ("Review fixes").
+echo "== m4 Q3 cost breakdown, s (3 runs | median), threads 1"
+scan3m() { local o; o=$(scan3 "$COL" "$@"); echo "$o | median $(echo "$o" | tr ' ' '\n' | grep . | sort -g | sed -n 2p)"; }
+echo "decode event_type,cost_micros:            $(scan3m --cols event_type,cost_micros)"
+echo "group none: count():                      $(q3 --agg "count()")"
+echo "group none: Q3 aggregates:                $(q3 --agg "$Q3A")"
+for G in device country advertiser_id campaign_id; do
+  echo "decode $G:$(printf '%*s' $((32 - ${#G})) '')$(scan3m --cols "$G")"
+  echo "decode $G,event_type,cost_micros:$(printf '%*s' $((14 - ${#G})) '')$(scan3m --cols "$G,event_type,cost_micros")"
+  echo "group $G: count():$(printf '%*s' $((24 - ${#G})) '')$(q3 --group "$G" --agg "count()")"
+  echo "group $G: Q3 aggregates:$(printf '%*s' $((18 - ${#G})) '')$(q3 --group "$G" --agg "$Q3A")"
+  "$B/bin/colstore" q --in "$COL" --group "$G" --agg "count()" --stats 2>&1 >/dev/null | grep '^aggregate' | sed "s/^/  $G /"
+done
 
 echo "== m4 ORDER BY on the 100K-group Q3 result: full sort vs LIMIT 20 (partial sort), sort seconds (3 runs)"
 for L in 0 20; do
@@ -230,6 +274,7 @@ fi  # STAGE != m5
 # decision. colstore is shown at 1 thread (SQLite is single-threaded, so this
 # is the like-for-like row) and at 8.
 echo "== m5 SQLite comparison"
+load "m5"
 if [ ! -x "$B/bin/colstore_sqlite" ]; then
   echo "skipped: $B/bin/colstore_sqlite was not built (cmake did not find sqlite3)"
   exit 0
@@ -243,6 +288,14 @@ Q3A="count_if(event_type=0) AS impressions,count_if(event_type=1) AS clicks,coun
 S1="SELECT COUNT(*) AS count FROM events WHERE country = 840 AND event_type = 1"
 S2="SELECT campaign_id, SUM(cost_micros) AS sum_cost_micros, COUNT(*) AS count FROM events WHERE event_time_us BETWEEN $T0 AND $((T0 + 3600000000)) GROUP BY campaign_id"
 S3="SELECT campaign_id, COUNT(*) FILTER (WHERE event_type = 0) AS impressions, COUNT(*) FILTER (WHERE event_type = 1) AS clicks, COUNT(*) FILTER (WHERE event_type = 2) AS conversions, SUM(cost_micros) AS cost_micros FROM events GROUP BY campaign_id"
+# Edge cases for the diff only (not timed): country 1 never occurs. E1 is
+# Q1's shape with nothing matching, plus SUM / MIN / MAX, so the answer is
+# one row (0, NULL, NULL, NULL); E2 is a GROUP BY with nothing matching, so
+# the answer is no rows. Both engines print NULL as an empty field.
+E1W="country=1 AND event_type=1"; E1A="count(),sum(cost_micros),min(cost_micros),max(cost_micros)"
+SE1="SELECT COUNT(*) AS count, SUM(cost_micros) AS sum_cost_micros, MIN(cost_micros) AS min_cost_micros, MAX(cost_micros) AS max_cost_micros FROM events WHERE country = 1 AND event_type = 1"
+E2W="country=1"; E2G=campaign_id; E2A="sum(cost_micros),count()"
+SE2="SELECT campaign_id, SUM(cost_micros) AS sum_cost_micros, COUNT(*) AS count FROM events WHERE country = 1 GROUP BY campaign_id"
 
 # median of three space-separated numbers
 med3() { echo "$1" | tr ' ' '\n' | grep . | sort -g | sed -n 2p; }
@@ -284,10 +337,14 @@ echo "-- answers: colstore q (1 thread) vs sqlite, CSVs sorted and diffed"
 "$B/bin/colstore_sqlite" query --db "$SQL" --sql "$S1" --runs 1 > "$OUT/sq_q1.csv" 2>/dev/null
 "$B/bin/colstore_sqlite" query --db "$SQL" --sql "$S2" --runs 1 > "$OUT/sq_q2.csv" 2>/dev/null
 "$B/bin/colstore_sqlite" query --db "$SQL" --sql "$S3" --runs 1 > "$OUT/sq_q3.csv" 2>/dev/null
+"$B/bin/colstore" q --in "$COL" --where "$E1W" --agg "$E1A" > "$OUT/cs_qe1.csv"
+"$B/bin/colstore" q --in "$COL" --where "$E2W" --group "$E2G" --agg "$E2A" > "$OUT/cs_qe2.csv"
+"$B/bin/colstore_sqlite" query --db "$SQL" --sql "$SE1" --runs 1 > "$OUT/sq_qe1.csv" 2>/dev/null
+"$B/bin/colstore_sqlite" query --db "$SQL" --sql "$SE2" --runs 1 > "$OUT/sq_qe2.csv" 2>/dev/null
 answers_ok=yes
-for q in 1 2 3; do
+for q in 1 2 3 e1 e2; do
   if diff <(LC_ALL=C sort "$OUT/cs_q$q.csv") <(LC_ALL=C sort "$OUT/sq_q$q.csv") > /dev/null; then
-    echo "   Q$q: identical ($(($(wc -l < "$OUT/cs_q$q.csv") - 1)) rows)"
+    echo "   Q$q: identical ($(($(wc -l < "$OUT/cs_q$q.csv") - 1)) rows)$([ "${q#e}" != "$q" ] && echo ": $(tail -n +2 "$OUT/cs_q$q.csv" | tr '\n' ' ')")"
   else
     echo "   Q$q: DIFFER"; answers_ok=no
   fi
@@ -332,6 +389,7 @@ zone_total=$(echo "$zone" | sed 's/.*row groups: \([0-9]*\) total.*/\1/')
 zone_skipped=$(echo "$zone" | sed 's/.*total, \([0-9]*\) skipped by zone map.*/\1/')
 rows1=$(($(wc -l < "$OUT/cs_q1.csv") - 1)); rows2=$(($(wc -l < "$OUT/cs_q2.csv") - 1)); rows3=$(($(wc -l < "$OUT/cs_q3.csv") - 1))
 
+load "m5 end"
 echo
 echo "== m5 results (markdown)"
 echo "SQLite $sq_version; $N events; answers identical: $answers_ok"

@@ -12,20 +12,27 @@ namespace colstore {
 // ---- KeyPacker ----------------------------------------------------------------------
 
 KeyPacker::KeyPacker(std::vector<ColumnId> cols, const Schema& schema) : cols_(std::move(cols)) {
-  unsigned word = 0, used = 0;  // bits used in the current word
+  // First fit: each column goes into the first word with room for it, so
+  // the order the columns are named in does not decide whether they fit.
+  // Widths are 8/16/32/64 bits, and for those first fit succeeds whenever
+  // the total is at most 128 bits (every reachable (bits used in word 0,
+  // bits used in word 1) state was checked; NOTES.md, "Review fixes").
+  // fields_ stays in column order, so pack_bits/unpack and the output keep
+  // the order the user gave; only the placement inside the key differs.
+  unsigned total = 0;
+  for (ColumnId c : cols_) total += static_cast<unsigned>(8 * value_width(spec_of(schema, c).type));
+  if (total > 128) {
+    throw std::invalid_argument("group key needs " + std::to_string(total) + " bits, at most 128 fit (two 64-bit words; "
+                                "u8/u16/u32 take 8/16/32 bits, u64/i64 64): group by fewer or narrower columns");
+  }
+  unsigned used[2] = {0, 0};  // bits used in each word
   for (ColumnId c : cols_) {
     const unsigned bits = static_cast<unsigned>(8 * value_width(spec_of(schema, c).type));
-    if (used + bits > 64) {  // does not fit in the rest of this word: start the next
-      ++word;
-      used = 0;
-    }
-    if (word > 1) {
-      throw std::invalid_argument("group key does not fit in 128 bits (columns are packed word by word, "
-                                  "8/16/32/64 bits each): group by fewer or narrower columns");
-    }
+    const unsigned word = used[0] + bits <= 64 ? 0u : 1u;
+    if (used[word] + bits > 64) throw std::logic_error("KeyPacker: first fit failed under 128 bits");  // cannot happen, see above
     const uint64_t mask = bits == 64 ? ~uint64_t{0} : (uint64_t{1} << bits) - 1;
-    fields_.push_back(Field{c, word, used, mask});
-    used += bits;
+    fields_.push_back(Field{c, word, used[word], mask});
+    used[word] += bits;
   }
 }
 
@@ -251,6 +258,12 @@ std::string format_value(ColumnType type, uint64_t bits) {
   return is_signed(type) ? std::to_string(as_signed(bits)) : std::to_string(bits);
 }
 
+std::string format_cell(const ResultTable& t, size_t col, size_t row) {
+  return t.is_null(col, row) ? std::string() : format_value(t.schema[col].type, t.at(col, row));
+}
+
+bool null_when_empty(AggKind k) { return k != AggKind::Count && k != AggKind::CountIf; }
+
 // ---- HashAggregate -------------------------------------------------------------------
 
 HashAggregate::HashAggregate(std::vector<ColumnId> group, std::vector<AggSpec> aggs, const Schema& schema)
@@ -275,6 +288,14 @@ HashAggregate::HashAggregate(std::vector<ColumnId> group, std::vector<AggSpec> a
     }
     agg_cols_.push_back(c);
   }
+  // Global aggregate: create group 0 now, so it exists (and is emitted)
+  // even if no row ever arrives, and so consume() never has to hash.
+  global_ = packer_.columns().empty();
+  if (global_) {
+    bool inserted = false;
+    table_.find_or_insert(GroupKey{}, &inserted);
+    for (const AggSpec& a : aggs_) state_.push_back(initial_state(a));
+  }
 }
 
 std::vector<ColumnId> HashAggregate::columns_needed() const {
@@ -297,6 +318,10 @@ uint64_t HashAggregate::initial_state(const AggSpec& a) {
 
 void HashAggregate::assign_groups(const Batch& b) {
   const uint32_t n = b.selected();
+  if (global_) {  // one group, already created: no key to pack, nothing to probe
+    group_of_.assign(n, 0);
+    return;
+  }
   group_of_.resize(n);
   const size_t na = aggs_.size();
   for (uint32_t k = 0; k < n; ++k) {
@@ -319,7 +344,11 @@ void HashAggregate::update(size_t a, const Batch& b) {
 
   switch (aggs_[a].kind) {
     case AggKind::Count:
-      for (uint32_t k = 0; k < n; ++k) state[group_of_[k] * na] += 1;
+      if (global_) {
+        state[0] += n;  // every selected row is in group 0
+      } else {
+        for (uint32_t k = 0; k < n; ++k) state[group_of_[k] * na] += 1;
+      }
       break;
     case AggKind::Sum:
       for (uint32_t k = 0; k < n; ++k) state[group_of_[k] * na] += cv.at(b.row(k));
@@ -411,6 +440,14 @@ ResultTable HashAggregate::finish() const {
   const uint32_t groups = table_.size();
   for (auto& c : t.cols) c.reserve(groups);
 
+  // A global aggregate that consumed no row is SQL's one row over an empty
+  // input: counts stay 0, and sum / min / max have no value (NULL).
+  if (global_ && rows_ == 0) {
+    t.nulls.assign(t.schema.size(), std::vector<uint8_t>(groups, 0));
+    for (size_t a = 0; a < aggs_.size(); ++a) {
+      if (null_when_empty(aggs_[a].kind)) t.nulls[ng + a][0] = 1;
+    }
+  }
   std::vector<uint64_t> key_bits;
   for (uint32_t g = 0; g < groups; ++g) {
     packer_.unpack(table_.key(g), key_bits);
@@ -420,6 +457,7 @@ ResultTable HashAggregate::finish() const {
       if (aggs_[a].kind == AggKind::Min || aggs_[a].kind == AggKind::Max) {
         v = order_key(v, agg_cols_[a].type);  // order_key is its own inverse (xor)
       }
+      if (t.is_null(ng + a, g)) v = 0;  // NULL cells carry pattern 0, not the initial state
       t.cols[ng + a].push_back(v);
     }
   }

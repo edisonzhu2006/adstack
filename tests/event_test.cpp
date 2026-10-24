@@ -1,9 +1,12 @@
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <string>
 
 #include <gtest/gtest.h>
+
+#include <sys/resource.h>
 
 #include "common/event.h"
 
@@ -105,4 +108,76 @@ TEST(Wire, CampaignIdOffsetMatchesDecode) {
     EXPECT_EQ(peeked, c);
     EXPECT_EQ(decode(buf).campaign_id, c);
   }
+}
+
+// ---- review fixes (2026-10-24): write errors are reported, not lost ------------
+
+namespace {
+
+// Caps this process's file size so writes past `bytes` fail with EFBIG
+// (SIGXFSZ ignored), which is how a full disk looks to the writer. ctest
+// runs every test in its own process, so the limit cannot leak.
+struct FileSizeLimit {
+  rlimit old{};
+  explicit FileSizeLimit(rlim_t bytes) {
+    std::signal(SIGXFSZ, SIG_IGN);
+    getrlimit(RLIMIT_FSIZE, &old);
+    rlimit lim = old;
+    lim.rlim_cur = bytes;
+    setrlimit(RLIMIT_FSIZE, &lim);
+  }
+  ~FileSizeLimit() { setrlimit(RLIMIT_FSIZE, &old); }
+};
+
+}  // namespace
+
+TEST(EventWriter, CloseReportsAWriteThatDidNotFit) {
+  const std::string path = temp_path("adstack_close_efbig.ads");
+  {
+    EventWriter w(path);
+    for (uint64_t i = 0; i < 1000; ++i) w.write(sample(i));  // 52 KB, still in the buffer
+    FileSizeLimit limit(4096);
+    EXPECT_THROW(w.close(), std::runtime_error);
+  }  // the destructor after a failed close must not throw or terminate
+  std::filesystem::remove(path);
+}
+
+TEST(EventWriter, DestructorIsBestEffortAndNeverThrows) {
+  // Used to call a throwing flush() from the destructor: on a full disk that
+  // was std::terminate (destructors are noexcept).
+  const std::string path = temp_path("adstack_dtor_efbig.ads");
+  {
+    FileSizeLimit limit(4096);
+    EventWriter w(path);
+    for (uint64_t i = 0; i < 1000; ++i) w.write(sample(i));
+  }
+  SUCCEED();
+  std::filesystem::remove(path);
+}
+
+TEST(EventWriter, BufferFullFlushFailureThrowsFromWrite) {
+  const std::string path = temp_path("adstack_write_efbig.ads");
+  {
+    FileSizeLimit limit(4096);
+    EventWriter w(path);
+    bool threw = false;
+    try {
+      for (uint64_t i = 0; i < 40'000; ++i) w.write(sample(i));  // > 1 MiB buffer
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    EXPECT_TRUE(threw);
+  }
+  std::filesystem::remove(path);
+}
+
+TEST(EventWriter, WriteAfterCloseIsALogicError) {
+  const std::string path = temp_path("adstack_closed.ads");
+  EventWriter w(path);
+  w.write(sample(1));
+  w.close();
+  EXPECT_EQ(std::filesystem::file_size(path), kFileHeaderSize + kEventWireSize);
+  EXPECT_THROW(w.write(sample(2)), std::logic_error);
+  w.close();  // idempotent
+  std::filesystem::remove(path);
 }

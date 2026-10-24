@@ -22,14 +22,21 @@
 // cols[c].at(sel[k]). gather() is the "project" step for consumers that
 // want a dense column of the survivors.
 //
-// Why batches ("vectors") of 1024 and not one row at a time: per-row
-// execution pays a virtual call / switch per row per operator and keeps no
-// value in a register across rows; per-batch execution amortizes the
-// dispatch over 1024 rows and runs tight loops the compiler can unroll and
-// vectorize. 1024 * 8 bytes = 8 KiB per column, so a handful of columns
-// stay in L1 while the loop runs. Why not whole row groups at a time: 64K
-// rows * 8 bytes * several columns leaves L1/L2 and the selection vector
-// grows accordingly. These claims are measured in NOTES.md.
+// What is batched and what is not: DECODE is chunk-at-a-time (a whole
+// row group's chunk of every needed column is decoded into a 64-bit array
+// before the first batch is handed out); FILTER and AGGREGATE run
+// batch-at-a-time over windows of up to 1024 rows of those arrays. A batch
+// is a window into already materialized data, not a unit of decoding, so
+// the batch size does not change how much is decoded or where it lives in
+// the cache; --vector 1 is therefore "row-at-a-time filter and aggregate
+// dispatch over chunk-decoded columns", not a row-at-a-time engine.
+// Why batches and not one row at a time: per-row dispatch pays the
+// operator setup (slicing the column pointers, resetting the selection
+// vector, walking the predicate list) per row; per-batch execution pays it
+// once per 1024 rows and leaves simple loops. The loops are branch-free
+// but scalar: apply_filter compiles to a load / subtract / compare /
+// conditional-increment loop with no SIMD (checked with objdump), and
+// nothing here relies on auto-vectorization. Measured in NOTES.md.
 //
 // Why a selection vector and not a bitmap or a compacted copy: the copy is
 // the expensive thing we are trying to avoid (selectivity in ads queries is

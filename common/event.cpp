@@ -99,11 +99,29 @@ EventWriter::EventWriter(const std::string& path, Mode mode) {
 }
 
 EventWriter::~EventWriter() {
+  if (!f_) return;
+  try {
+    flush();
+  } catch (...) {
+    // Swallowed on purpose; see the header. close() is the checked path.
+  }
+  if (owns_) std::fclose(f_);
+}
+
+void EventWriter::close() {
+  if (!f_) return;
   flush();
-  if (owns_ && f_) std::fclose(f_);
+  FILE* f = f_;
+  f_ = nullptr;
+  if (owns_) {
+    if (std::fclose(f) != 0) throw std::runtime_error("close of event file failed");
+  } else if (std::fflush(f) != 0) {
+    throw std::runtime_error("flush of event stream failed");
+  }
 }
 
 void EventWriter::write(const Event& e) {
+  if (!f_) throw std::logic_error("EventWriter::write after close");
   uint8_t tmp[kEventWireSize];
   encode(e, tmp);
   buf_.insert(buf_.end(), tmp, tmp + kEventWireSize);
@@ -112,16 +130,17 @@ void EventWriter::write(const Event& e) {
 }
 
 void EventWriter::flush() {
-  if (buf_.empty()) return;
+  if (buf_.empty() || !f_) return;
   if (std::fwrite(buf_.data(), 1, buf_.size(), f_) != buf_.size()) {
-    throw std::runtime_error("short write");
+    throw std::runtime_error("short write to event file");
   }
   bytes_ += buf_.size();
   buf_.clear();
-  std::fflush(f_);
+  if (std::fflush(f_) != 0) throw std::runtime_error("flush of event file failed");
 }
 
 void EventWriter::sync() {
+  if (!f_) throw std::logic_error("EventWriter::sync after close");
   flush();
   const int fd = ::fileno(f_);
 #if defined(__APPLE__)

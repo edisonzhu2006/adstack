@@ -48,17 +48,19 @@
 // directory entry is data of the directory, and a crash can otherwise lose
 // the rename while keeping the file). On macOS fsync only pushes data to the
 // drive's cache; fcntl(F_FULLFSYNC) asks the drive to flush that cache too,
-// so durable_sync() uses it when available. Snapshots are written before the
+// so durable_sync() and durable_sync_dir() both use it when the file system
+// supports it (plain fsync otherwise). Snapshots are written before the
 // manifest, so the manifest's rename is the single commit point: either
 // MANIFEST names epoch k and all P snapshots of k exist, or it still names
 // k-1 and epoch k is garbage to be deleted on resume.
 //
 // SNAPSHOT FORMAT (little-endian, fixed-width fields, no padding):
-//   u32 magic "SKS1"       u32 version (1)
+//   u32 magic "SKS1"       u32 version (2)
 //   u64 epoch              u32 worker   u32 partitions   u64 input_offset
 //   u64 out_bytes          u64 late_bytes
 //   i64 max_event_time_us  i64 watermark_us
-//   u64 events  u64 dups  u64 late  u64 windows_emitted   (cumulative counters)
+//   u64 events  u64 dups  u64 late  u64 expired  u64 windows_emitted
+//                                                        (cumulative counters)
 //   u64 n_windows, then n_windows x { i64 window_start_us, u32 campaign_id,
 //                                     u64 impressions, u64 clicks, u64 conversions,
 //                                     i64 cost_micros }
@@ -89,7 +91,11 @@ namespace adstack {
 // fsync the file, using F_FULLFSYNC on Apple platforms when the file system
 // supports it (falls back to fsync when it does not). Throws on failure.
 void durable_sync(int fd);
-// fsync a directory so renames and creations inside it are durable.
+// fsync a directory so renames, creations and deletions inside it are
+// durable. F_FULLFSYNC on Apple too, for the same reason as durable_sync():
+// by the reasoning above a plain fsync would leave the directory entry in
+// the drive's cache, so the rename it is meant to make durable would not
+// survive a power loss. Falls back to fsync where F_FULLFSYNC is refused.
 void durable_sync_dir(const std::filesystem::path& dir);
 // Write bytes to `<final>.tmp`, fsync, rename over `final`, fsync the parent
 // directory. After it returns, `final` either has the new content or (if the
@@ -119,6 +125,7 @@ struct WorkerSnapshot {
   uint64_t events = 0;
   uint64_t dups = 0;
   uint64_t late = 0;
+  uint64_t expired = 0;        // of `late`, how many were past the dedup horizon
   uint64_t windows_emitted = 0;
   std::vector<std::pair<WindowKey, Agg>> open_windows;  // in map order
   DedupState dedup;
@@ -135,10 +142,32 @@ WorkerSnapshot read_snapshot_file(const std::filesystem::path& path);
 
 // ---- manifest -----------------------------------------------------------------
 
+// Identity of an input file, cheap enough to take at every start: its size
+// and FNV-1a over its first and last min(size, 1 MiB) bytes. A resume
+// against a different file (another seed of the same size, say) is refused
+// instead of splicing two streams together. The input must stay unchanged
+// for the life of the run, restarts included; a file that is appended to
+// between restarts has a new identity and cannot be resumed. Not a proof of
+// identity (two files could share size, head and tail), but it turns the
+// mistakes that actually happen into a loud error.
+struct InputFingerprint {
+  uint64_t size = 0;
+  uint64_t head_fnv = 0;
+  uint64_t tail_fnv = 0;
+
+  bool operator==(const InputFingerprint&) const = default;
+};
+// Reads the two blocks with pread(2), so the file offset is not moved.
+InputFingerprint fingerprint_input(int fd);
+
 // What the resumed run needs to know, and what it checks its own flags
-// against (a resume with a different partition count would put campaigns on
-// the wrong workers; different window parameters would make the snapshots
-// meaningless). Text, one `key value` per line, so `cat MANIFEST` works.
+// against: a different partition count would put campaigns on the wrong
+// workers; different window parameters would make the snapshots
+// meaningless; a different checkpoint interval would number new epochs so
+// that one can land on the committed epoch's directory and overwrite its
+// snapshots in place; adding or dropping --late-out would orphan or miss the
+// late part files; a different input would be spliced onto the old one.
+// Text, one `key value` per line, so `cat MANIFEST` works.
 struct Manifest {
   uint64_t epoch = 0;
   uint64_t input_offset = 0;
@@ -148,6 +177,9 @@ struct Manifest {
   int64_t lateness_us = 0;
   int64_t dedup_bucket_us = 0;
   bool dedup = true;
+  uint64_t checkpoint_every_events = 1'000'000;  // Config's default
+  bool late_out = false;            // whether the run writes a late side file
+  InputFingerprint input;
 
   bool operator==(const Manifest&) const = default;
 };
@@ -177,6 +209,15 @@ bool checkpoint_dir_has_state(const std::filesystem::path& ckpt_dir);
 //     of k must exist or the checkpoint is corrupt (runtime_error).
 // Also removes a stray manifest.tmp.
 std::optional<Manifest> prepare_resume(const std::filesystem::path& ckpt_dir);
+
+// Deletes a checkpoint directory once the run's output is committed.
+// MANIFEST goes first (and, when durable, the directory is synced), then
+// everything else. std::filesystem::remove_all deletes in directory order,
+// which on APFS can be epoch-k before MANIFEST; a crash in between used to
+// leave a MANIFEST naming a missing epoch, which the next --resume reports
+// as corruption. With MANIFEST gone first, every crash point leaves either a
+// complete checkpoint or no MANIFEST (start over, rewrite the same output).
+void remove_checkpoint_dir(const std::filesystem::path& ckpt_dir, bool durable);
 
 // ---- coordinator ----------------------------------------------------------------
 

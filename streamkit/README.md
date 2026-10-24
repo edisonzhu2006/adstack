@@ -4,20 +4,30 @@ Streaming aggregation engine for ad events: reads events in ingest order,
 drops duplicates, assigns each event to its window(s) by event time, closes
 windows with an event-time watermark, and writes one CSV row per
 (window, campaign). Events whose window already closed are written to a side
-file and counted, never dropped silently. Output is byte-compatible with
+file and counted, never dropped silently (but see "The late side file"
+below: it is not deduplicated past the dedup horizon). Output is byte-compatible with
 `tools/oracle`, the batch ground truth, so the two can be diffed.
 
 From m3 the engine is multithreaded: one reader thread hash-partitions
 events by `campaign_id` into bounded single-producer single-consumer queues,
 and P worker threads each own a dedup set, an open-window map, a watermark
-and an output part file. Nothing on the hot path is shared.
+and an output part file. No mutable state of ours is shared on the hot
+path; the process-wide allocator and libc (malloc/free per dedup id and
+window, `fprintf` per row) still are, and NOTES.md m5 measures a per-row
+cost that grows with the worker count, which that shared machinery is the
+likely cause of.
 
 From m4 the engine checkpoints: every N events the reader drops a marker
 into every queue, each worker snapshots its state atomically when the marker
 reaches it, and a MANIFEST rename commits the epoch. `--resume` continues
-from the last commit with byte-identical output, which `bench/crash.sh`
-proves by SIGKILLing the process at random points and diffing the final
-result against the oracle.
+from the last commit. `bench/crash.sh` SIGKILLs the process at random
+points, resumes until it exits 0, and checks two things per trial: the
+same rows as the oracle (`compare.sh`, which sorts) and byte identity of
+the CSV and the late file against one uninterrupted run with the same
+flags (`cmp`). The MANIFEST pins the input (size plus a hash of its first
+and last MiB), the thread count, the window parameters, the checkpoint
+interval and whether `--late-out` is on; a resume that differs in any of
+them is refused with the field named.
 
 Design decisions are in [NOTES.md](NOTES.md); every measured number, with
 the machine, load, and command that produced it, is in
@@ -30,13 +40,16 @@ streamkit --in FILE --out FILE [--window-s 60] [--slide-s WINDOW] [--lateness-s 
           [--late-out FILE] [--threads P] [--queue-depth 4096] [--batch 128]
           [--dedup-bucket-s 1] [--no-dedup] [--reader-decode]
           [--ckpt-dir DIR] [--checkpoint-every-events 1000000] [--resume] [--throttle-eps N]
-          [--no-fsync] [--latency-stats]
+          [--no-fsync] [--latency-stats] [--fail-after-checkpoint K]
 ```
+
+Unknown flags and malformed numbers (`--threds 4`, `--lateness-s 1.5`) are
+errors with exit 2; durations are whole seconds in [1, 2^50 us].
 
 | flag | meaning |
 |---|---|
 | `--in` | event file in the shared `.ads` format, or `-` for stdin |
-| `--out` | CSV output (`window_start_us,campaign_id,impressions,clicks,conversions,cost_micros`), or `-` for stdout |
+| `--out` | CSV output (`window_start_us,campaign_id,impressions,clicks,conversions,cost_micros`), or `-` for stdout. A file appears only when the run commits at end of input (parts are merged and renamed); with `-` each batch's rows are written and flushed to stdout as their windows close, so a consumer sees them during the run (no checkpoints in that mode) |
 | `--window-s` | window length in seconds (default 60) |
 | `--slide-s` | window hop in seconds; `< --window-s` gives overlapping sliding windows, each event counted in `window/slide` of them (default = window, i.e. tumbling) |
 | `--lateness-s` | how long after a window's end events for it are still accepted; `watermark = max(event_time) - lateness`, per worker (default 0, close immediately) |
@@ -52,10 +65,12 @@ streamkit --in FILE --out FILE [--window-s 60] [--slide-s WINDOW] [--lateness-s 
 | `--resume` | continue from `--ckpt-dir`'s `MANIFEST` if there is one, otherwise start from byte 0; without this flag a checkpoint directory that holds state is an error |
 | `--throttle-eps` | cap the reader at N events/s so a run lasts long enough to be killed mid-flight (crash tests; 0 = unlimited) |
 | `--no-fsync` | skip every fsync in the checkpoint path, to measure what durability costs; a checkpoint then survives SIGKILL but not power loss |
-| `--latency-stats` | print min/p50/p99/max emit latency at exit: per window closed by the watermark, wall time from `read(2)` returning the input block that holds the closing event to the row being appended (`latency.h`, NOTES.md m5 for the exact definition), plus how many `read(2)` calls the input arrived in; zero cost when off |
+| `--fail-after-checkpoint` | test hook: the reader aborts the run (exit 1) right after injecting marker K, leaving a checkpoint to `--resume` from; used by the unit tests and to drive resume cases by hand (0 = off) |
+| `--latency-stats` | print min/p50/p99/max emit latency at exit: per window closed by the watermark, wall time from `read(2)` returning the input block that holds the closing event to the row being written to stdout (`--out -`) or appended to the part file's buffer (`--out FILE`, not yet visible to anyone) (`latency.h`, NOTES.md m5 and "Review fixes" for the exact definition), plus how many `read(2)` calls the input arrived in; zero cost when off |
 
 The stderr summary has three lines (four with `--ckpt-dir`): totals
-(events, dups, late, windows, wall time, events/s, threads); the scaling
+(events, dups, late and how many of those were past the dedup horizon,
+windows, wall time, events/s over the events this run read, threads); the scaling
 diagnostics (per-worker event counts and busy time, batches, reader stalls =
 reader found a queue full, worker idle waits = worker found its queue empty,
 merge time); the configuration with the dedup and open-window peaks; and the
@@ -94,7 +109,7 @@ average and exact command above every table, three runs per cell with the
 median in bold:
 
 ```
-bench/throughput.sh build-sk                          # all five sections, about 4 minutes
+bench/throughput.sh build-sk                          # all five sections, several minutes
 bench/throughput.sh build-sk --only threads,latency   # a subset
 bench/throughput.sh build-sk --reader-decode          # extra flags go to every streamkit run
 ```
@@ -105,15 +120,40 @@ bench/throughput.sh build-sk --reader-decode          # extra flags go to every 
 | `dedup` | dedup on vs `--no-dedup` on a dirty and a clean stream, 1 and 8 threads |
 | `checkpoint` | no checkpoints vs every 1M vs every 100K events, 8 threads, with the snapshot cost |
 | `memory` | max RSS (`/usr/bin/time -l`) at 1M and 10M events, 1 and 8 threads, and 8 threads with `--queue-depth 256` |
-| `latency` | `gen --pace` at 200K events/s for 20 s piped into `--window-s 1 --lateness-s 2 --latency-stats`, 1 and 8 threads, min/p50/p99/max per run and the median over runs |
+| `latency` | `gen --pace` at 200K events/s for 20 s piped into `--out - --window-s 1 --lateness-s 2 --latency-stats` and on into `cat`, 1 and 8 threads, min/p50/p99/max per run and the median over runs |
 
 The inputs (1.1 GB) are generated once by seed and cached in
-`/private/tmp/adstack-sk`. The latency section checks gen's and streamkit's
+`$ADSTACK_CACHE` (default `/private/tmp/adstack-sk`); outputs, checkpoints
+and logs go to a private `mktemp` directory, so concurrent harness runs do
+not collide. The latency section checks gen's and streamkit's
 exit statuses separately (a SIGPIPE in gen would mean streamkit closed the
 pipe early), prints both with streamkit's stderr if a run fails, and
 retries that run once. Timing sections are only as good as the machine:
 check `ps` for other benchmarks first; the memory section and the crash
 harness do not care.
+
+## The late side file, and what it does not promise
+
+Every event diverted as late is counted and, with `--late-out`, written.
+Events past the dedup horizon (Dedup's `kExpired`, reported as "past the
+dedup horizon" on stderr) are diverted without an id check, because the
+set no longer remembers them. The aggregates are exactly right regardless
+(proof in `dedup.h`), but when the stream re-delivers events later than
+window + lateness the late file can contain re-deliveries of events that
+were already counted, and repeats of one id. A consumer that re-adds late
+events must deduplicate them by `event_id` against the output first. The
+count is zero whenever the horizon covers the re-delivery delay (the
+generator's defaults).
+
+Event times must lie in [-2^62, 2^62] us (about 146,000 years either side
+of 1970); a record outside fails the run with its event_id rather than
+feeding signed overflow into the window arithmetic, and the oracle rejects
+it the same way. A per-window cost sum that overflows int64 also fails
+loudly. There is no bound on how far *ahead* a timestamp may be: one
+far-future record advances its worker's watermark for good (standard
+max-watermark semantics), and every later real event of that partition is
+then late. A guard (maximum watermark advance per event) is listed in
+NOTES.md as future work.
 
 ## How it works
 
@@ -129,10 +169,11 @@ reader (main thread)                     workers (one thread each)
     batches, publish a marker                4. add to every window containing it
     (epoch k, offset X) to every queue       5. close windows the watermark passed
   at EOF: flush partials, send eof         append rows to <out>.part<p>
+                                           (--out -: write them to stdout per batch)
 main thread after join:
   late parts  -> <late>.tmp  -> rename
   header + out parts -> <out>.tmp -> rename      (the commit of the run)
-  remove the checkpoint dir, then the parts
+  remove MANIFEST (synced), then the checkpoint dir, then the parts
 ```
 
 Per event in a worker, in this order:
@@ -159,7 +200,8 @@ has the full protocol and the file format):
    cumulative counters) to `epoch-k/worker-i.tmp`, fsync, rename to
    `worker-i.snap`, fsync the directory.
 3. Report to the coordinator. The last of the P workers to report writes
-   `manifest.tmp` {epoch k, offset X, P, window parameters}, fsyncs, renames
+   `manifest.tmp` {epoch k, offset X, P, window parameters, interval,
+   late-out flag, input fingerprint}, fsyncs, renames
    it to `MANIFEST`, and deletes `epoch-(k-1)`. The rename is the commit.
 
 Resume (`--resume`): read `MANIFEST`, delete every epoch directory other

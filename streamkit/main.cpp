@@ -17,14 +17,17 @@
 //             [--lateness-s 0] [--late-out late.ads] [--threads P] [--queue-depth 4096]
 //             [--batch 128] [--dedup-bucket-s 1] [--no-dedup] [--reader-decode]
 //             [--ckpt-dir DIR] [--checkpoint-every-events 1000000] [--resume]
-//             [--throttle-eps N] [--no-fsync] [--latency-stats]
+//             [--throttle-eps N] [--no-fsync] [--latency-stats] [--fail-after-checkpoint K]
 //   gen --n 1000000 --pace --out - | streamkit --in - --out live.csv --latency-stats
 
 #include <algorithm>
 #include <cstdio>
 #include <exception>
+#include <string>
 #include <thread>
+#include <vector>
 
+#include "common/agg.h"
 #include "common/args.h"
 #include "pipeline.h"
 
@@ -38,7 +41,7 @@ void usage() {
     "          [--late-out FILE] [--threads P] [--queue-depth 4096] [--batch 128]\n"
     "          [--dedup-bucket-s 1] [--no-dedup] [--reader-decode]\n"
     "          [--ckpt-dir DIR] [--checkpoint-every-events 1000000] [--resume] [--throttle-eps N]\n"
-    "          [--no-fsync] [--latency-stats]\n"
+    "          [--no-fsync] [--latency-stats] [--fail-after-checkpoint K]\n"
     "  --slide-s        window hop; < --window-s gives overlapping (sliding) windows,\n"
     "                   default = window (tumbling)\n"
     "  --lateness-s     how long after a window's end we keep accepting events for it;\n"
@@ -60,7 +63,14 @@ void usage() {
     "                   checkpoint then survives SIGKILL but not power loss)\n"
     "  --latency-stats  print min/p50/p99/max emit latency at exit: per window closed by the\n"
     "                   watermark, wall time from the closing event's block being read to\n"
-    "                   the row being appended (zero cost when off)\n");
+    "                   the row being written to stdout (--out -) or appended to the part\n"
+    "                   file's buffer (--out FILE, visible only at end of input; zero cost when off)\n"
+    "  --fail-after-checkpoint K\n"
+    "                   TEST HOOK: the reader aborts the run (exit 1) right after injecting\n"
+    "                   checkpoint marker K, leaving a checkpoint to --resume from. 0 = off\n"
+    "  --out -          rows are written to stdout as windows close; with --out FILE they\n"
+    "                   appear only when the run commits at end of input\n"
+    "Unknown flags and malformed numbers are errors (exit 2).\n");
 }
 
 int default_threads() {
@@ -70,50 +80,85 @@ int default_threads() {
 
 }  // namespace
 
+// Durations are given in whole seconds and kept in microseconds; the bound
+// keeps both the multiplication and all later window arithmetic inside
+// int64 (common/agg.h, kMaxDurationUs).
+constexpr int64_t kMaxSeconds = kMaxDurationUs / 1'000'000;
+
 int main(int argc, char** argv) {
   Args args(argc, argv);
-  if (!args.has("--in") || !args.has("--out") || args.has("--help")) {
+  if (args.has("--help")) {
     usage();
-    return args.has("--help") ? 0 : 2;
+    return 0;
+  }
+  const std::vector<std::string> bad = args.unknown(
+      {"--in", "--out", "--late-out", "--window-s", "--slide-s", "--lateness-s", "--dedup-bucket-s",
+       "--no-dedup", "--threads", "--queue-depth", "--batch", "--reader-decode", "--ckpt-dir",
+       "--checkpoint-every-events", "--resume", "--throttle-eps", "--fail-after-checkpoint", "--no-fsync",
+       "--latency-stats"});
+  if (!bad.empty()) {
+    std::fprintf(stderr, "streamkit: unknown argument '%s' (see --help)\n", bad.front().c_str());
+    return 2;
+  }
+  if (!args.has("--in") || !args.has("--out")) {
+    usage();
+    return 2;
   }
 
   Config cfg;
-  cfg.in_path = args.str("--in", "");
-  cfg.out_path = args.str("--out", "-");
-  cfg.late_out_path = args.str("--late-out", "");
-  cfg.window_us = args.i64("--window-s", 60) * 1'000'000;
-  cfg.slide_us = args.i64("--slide-s", cfg.window_us / 1'000'000) * 1'000'000;
-  cfg.lateness_us = args.i64("--lateness-s", 0) * 1'000'000;
-  cfg.dedup_bucket_us = args.i64("--dedup-bucket-s", 1) * 1'000'000;
-  cfg.dedup = !args.has("--no-dedup");
-  cfg.threads = static_cast<int>(args.i64("--threads", default_threads()));
-  cfg.queue_depth = static_cast<size_t>(args.i64("--queue-depth", 4096));
-  cfg.batch_events = static_cast<size_t>(args.i64("--batch", 128));
-  cfg.reader_decode = args.has("--reader-decode");
-  cfg.ckpt_dir = args.str("--ckpt-dir", "");
-  cfg.checkpoint_every_events = static_cast<uint64_t>(args.i64("--checkpoint-every-events", 1'000'000));
-  cfg.resume = args.has("--resume");
-  cfg.throttle_eps = args.dbl("--throttle-eps", 0);
-  cfg.fail_after_checkpoint = static_cast<uint64_t>(args.i64("--fail-after-checkpoint", 0));
-  cfg.fsync = !args.has("--no-fsync");
-  cfg.latency_stats = args.has("--latency-stats");
-
-  if (cfg.window_us <= 0 || cfg.dedup_bucket_us <= 0 || cfg.lateness_us < 0) {
-    std::fprintf(stderr, "streamkit: --window-s and --dedup-bucket-s must be >= 1, --lateness-s >= 0\n");
+  int64_t window_s = 0, slide_s = 0, lateness_s = 0, bucket_s = 0, threads = 0, depth = 0, batch = 0,
+          every = 0, fail_after = 0;
+  try {
+    window_s = args.i64("--window-s", 60);
+    slide_s = args.i64("--slide-s", window_s);
+    lateness_s = args.i64("--lateness-s", 0);
+    bucket_s = args.i64("--dedup-bucket-s", 1);
+    threads = args.i64("--threads", default_threads());
+    depth = args.i64("--queue-depth", 4096);
+    batch = args.i64("--batch", 128);
+    every = args.i64("--checkpoint-every-events", 1'000'000);
+    fail_after = args.i64("--fail-after-checkpoint", 0);
+    cfg.throttle_eps = args.dbl("--throttle-eps", 0);
+  } catch (const std::exception& ex) {
+    std::fprintf(stderr, "streamkit: %s\n", ex.what());
     return 2;
   }
-  if (cfg.slide_us <= 0 || cfg.slide_us > cfg.window_us) {
+  if (window_s < 1 || bucket_s < 1 || lateness_s < 0 || window_s > kMaxSeconds || bucket_s > kMaxSeconds ||
+      lateness_s > kMaxSeconds) {
+    std::fprintf(stderr, "streamkit: --window-s and --dedup-bucket-s must be in [1, %lld], --lateness-s in [0, %lld]\n",
+                 static_cast<long long>(kMaxSeconds), static_cast<long long>(kMaxSeconds));
+    return 2;
+  }
+  if (slide_s < 1 || slide_s > window_s) {
     std::fprintf(stderr, "streamkit: need 1 <= --slide-s <= --window-s\n");
     return 2;
   }
-  if (cfg.threads < 1 || args.i64("--queue-depth", 4096) < 2 || args.i64("--batch", 128) < 1) {
-    std::fprintf(stderr, "streamkit: --threads >= 1, --queue-depth >= 2, --batch >= 1\n");
+  if (threads < 1 || threads > 1024 || depth < 2 || batch < 1) {
+    std::fprintf(stderr, "streamkit: --threads in [1, 1024], --queue-depth >= 2, --batch >= 1\n");
     return 2;
   }
-  if (args.i64("--checkpoint-every-events", 1) < 1 || cfg.throttle_eps < 0) {
-    std::fprintf(stderr, "streamkit: --checkpoint-every-events >= 1, --throttle-eps >= 0\n");
+  if (every < 1 || fail_after < 0 || cfg.throttle_eps < 0) {
+    std::fprintf(stderr, "streamkit: --checkpoint-every-events >= 1, --fail-after-checkpoint >= 0, --throttle-eps >= 0\n");
     return 2;
   }
+  cfg.in_path = args.str("--in", "");
+  cfg.out_path = args.str("--out", "-");
+  cfg.late_out_path = args.str("--late-out", "");
+  cfg.window_us = window_s * 1'000'000;
+  cfg.slide_us = slide_s * 1'000'000;
+  cfg.lateness_us = lateness_s * 1'000'000;
+  cfg.dedup_bucket_us = bucket_s * 1'000'000;
+  cfg.dedup = !args.has("--no-dedup");
+  cfg.threads = static_cast<int>(threads);
+  cfg.queue_depth = static_cast<size_t>(depth);
+  cfg.batch_events = static_cast<size_t>(batch);
+  cfg.reader_decode = args.has("--reader-decode");
+  cfg.ckpt_dir = args.str("--ckpt-dir", "");
+  cfg.checkpoint_every_events = static_cast<uint64_t>(every);
+  cfg.resume = args.has("--resume");
+  cfg.fail_after_checkpoint = static_cast<uint64_t>(fail_after);
+  cfg.fsync = !args.has("--no-fsync");
+  cfg.latency_stats = args.has("--latency-stats");
   if (cfg.resume && cfg.ckpt_dir.empty()) {
     std::fprintf(stderr, "streamkit: --resume needs --ckpt-dir\n");
     return 2;
@@ -144,6 +189,7 @@ int main(int argc, char** argv) {
     total.events += w.events;
     total.dups += w.dups;
     total.late += w.late;
+    total.expired += w.expired;
     total.windows_emitted += w.windows_emitted;
     total.batches += w.batches;
     total.idle_waits += w.idle_waits;
@@ -152,13 +198,16 @@ int main(int argc, char** argv) {
     min_events = std::min(min_events, w.events);
     max_events = std::max(max_events, w.events);
   }
-  const double eps = r.total_secs > 0 ? static_cast<double>(total.events) / r.total_secs : 0.0;
+  // events/s is over the events this run read (r.events), not the workers'
+  // cumulative counts, which a resumed run inherits from its snapshots.
+  const double eps = r.total_secs > 0 ? static_cast<double>(r.events) / r.total_secs : 0.0;
   std::fprintf(stderr,
-               "streamkit: %llu events, %llu dups, %llu late, %llu windows, %.2fs, %.0f events/s, "
-               "%d threads\n",
+               "streamkit: %llu events, %llu dups, %llu late (%llu past the dedup horizon), %llu windows, "
+               "%.2fs, %.0f events/s, %d threads\n",
                static_cast<unsigned long long>(total.events),
                static_cast<unsigned long long>(total.dups),
                static_cast<unsigned long long>(total.late),
+               static_cast<unsigned long long>(total.expired),
                static_cast<unsigned long long>(total.windows_emitted), r.total_secs, eps,
                cfg.threads);
   std::fprintf(stderr,
@@ -217,13 +266,19 @@ int main(int argc, char** argv) {
       // input reads says how finely the arrival stamps were taken: on a pipe
       // fed by gen --pace it is the producer's write granularity.
       const uint64_t reads = r.input_reads > 0 ? r.input_reads : 1;
+      // The end point differs by output mode, and the label says which: with
+      // --out - the row is in stdout (visible to the consumer); with a file
+      // it is in the part file's buffer and nobody sees it before the run
+      // commits at end of input.
+      const char* end_point = cfg.out_path == "-" ? "block read -> row written to stdout"
+                                                  : "block read -> row appended to part buffer, not yet visible";
       std::fprintf(stderr,
                    "streamkit: emit latency over %zu watermark-closed windows: min %u us, p50 %u us, "
-                   "p99 %u us, max %u us (block read -> row appended; excludes lateness); "
+                   "p99 %u us, max %u us (%s; excludes lateness); "
                    "input reads %llu (mean %llu events/read)\n",
-                   lat.count, lat.min_us, lat.p50_us, lat.p99_us, lat.max_us,
+                   lat.count, lat.min_us, lat.p50_us, lat.p99_us, lat.max_us, end_point,
                    static_cast<unsigned long long>(r.input_reads),
-                   static_cast<unsigned long long>(total.events / reads));
+                   static_cast<unsigned long long>(r.events / reads));
     }
   }
   return 0;

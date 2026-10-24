@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <map>
@@ -86,6 +87,39 @@ TEST(KeyPacker, RejectsKeysWiderThan128Bits) {
   EXPECT_THROW(KeyPacker({ColumnId::EventId, ColumnId::VideoId, ColumnId::Device}), std::invalid_argument);
   EXPECT_THROW(KeyPacker({ColumnId::Device, ColumnId::EventId, ColumnId::VideoId}), std::invalid_argument);
   EXPECT_NO_THROW(KeyPacker({}));  // no group columns: the zero key
+  try {
+    KeyPacker({ColumnId::EventId, ColumnId::VideoId, ColumnId::Device});
+    FAIL();
+  } catch (const std::invalid_argument& e) {
+    EXPECT_NE(std::string(e.what()).find("needs 136 bits"), std::string::npos) << e.what();
+  }
+}
+
+TEST(KeyPacker, FirstFitMakesColumnOrderIrrelevantToWhetherAKeyFits) {
+  // u32 + u64 + u32 = 128 bits. Packing word by word in the given order
+  // used to reject this (32 + 64 > 64 moved to word 1, then 64 + 32 > 64);
+  // first fit puts advertiser_id back into word 0.
+  KeyPacker p({ColumnId::CampaignId, ColumnId::EventId, ColumnId::AdvertiserId});
+  const GroupKey k = p.pack_bits({0x11111111, 0x2222222233333333ULL, 0x44444444});
+  EXPECT_EQ(k.lo, 0x11111111ULL | (0x44444444ULL << 32));
+  EXPECT_EQ(k.hi, 0x2222222233333333ULL);
+  std::vector<uint64_t> back;
+  p.unpack(k, back);
+  EXPECT_EQ(back, (std::vector<uint64_t>{0x11111111, 0x2222222233333333ULL, 0x44444444}));  // column order kept
+  // Every order of the same three columns fits and round-trips.
+  std::vector<ColumnId> cols = {ColumnId::CampaignId, ColumnId::EventId, ColumnId::AdvertiserId};
+  std::sort(cols.begin(), cols.end());
+  do {
+    KeyPacker q(cols);
+    std::vector<uint64_t> bits;
+    for (ColumnId c : cols) bits.push_back(c == ColumnId::EventId ? 0xFEDCBA9876543210ULL : 0x89ABCDEF);
+    std::vector<uint64_t> out;
+    q.unpack(q.pack_bits(bits), out);
+    EXPECT_EQ(out, bits);
+  } while (std::next_permutation(cols.begin(), cols.end()));
+  // u8 + u64 + u32 + u16 = 120 bits, fits; u64 + u8 + u64 = 136 does not.
+  EXPECT_NO_THROW(KeyPacker({ColumnId::Device, ColumnId::VideoId, ColumnId::CampaignId, ColumnId::Country}));
+  EXPECT_THROW(KeyPacker({ColumnId::VideoId, ColumnId::Device, ColumnId::EventId}), std::invalid_argument);
 }
 
 TEST(KeyPacker, PackFromBatchMasksToColumnWidth) {

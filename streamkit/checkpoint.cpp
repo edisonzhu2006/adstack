@@ -83,8 +83,11 @@ class ByteReader {
 };
 
 constexpr uint32_t kSnapshotMagic = 0x31534B53;  // "SKS1" read little-endian
-constexpr uint32_t kSnapshotVersion = 1;
-constexpr const char* kManifestHeader = "streamkit-checkpoint-manifest v1";
+// v2 (2026-10-24 review fixes): snapshot gains the `expired` counter,
+// MANIFEST gains the checkpoint interval, the late-out flag and the input
+// fingerprint. A v1 checkpoint is refused rather than guessed at.
+constexpr uint32_t kSnapshotVersion = 2;
+constexpr const char* kManifestHeader = "streamkit-checkpoint-manifest v2";
 
 }  // namespace
 
@@ -104,9 +107,14 @@ void durable_sync(int fd) {
 void durable_sync_dir(const fs::path& dir) {
   const int fd = ::open(dir.c_str(), O_RDONLY);
   if (fd < 0) throw std::runtime_error(errno_text("open dir for fsync"));
-  // Plain fsync for directories: the directory's data is its entries, and
-  // those are tiny metadata writes the file system journals itself.
-  const int rc = ::fsync(fd);
+  // Same treatment as a file (see the header): a plain fsync on macOS gets
+  // the new directory entry as far as the drive's cache, which is exactly
+  // the gap F_FULLFSYNC exists to close. Plain fsync is the fallback.
+  int rc = -1;
+#if defined(__APPLE__)
+  rc = ::fcntl(fd, F_FULLFSYNC);
+#endif
+  if (rc != 0) rc = ::fsync(fd);
   const int saved = errno;
   ::close(fd);
   if (rc != 0) {
@@ -163,6 +171,7 @@ std::vector<uint8_t> encode_snapshot(const WorkerSnapshot& s) {
   w.put(s.events);
   w.put(s.dups);
   w.put(s.late);
+  w.put(s.expired);
   w.put(s.windows_emitted);
   w.put(static_cast<uint64_t>(s.open_windows.size()));
   for (const auto& [k, a] : s.open_windows) {
@@ -208,6 +217,7 @@ WorkerSnapshot decode_snapshot(const std::vector<uint8_t>& bytes) {
   s.events = r.get<uint64_t>();
   s.dups = r.get<uint64_t>();
   s.late = r.get<uint64_t>();
+  s.expired = r.get<uint64_t>();
   s.windows_emitted = r.get<uint64_t>();
   const uint64_t n_windows = r.get<uint64_t>();
   // Each window takes 44 bytes; refuse a count the buffer cannot hold before
@@ -267,7 +277,12 @@ std::string format_manifest(const Manifest& m) {
     << "slide_us " << m.slide_us << "\n"
     << "lateness_us " << m.lateness_us << "\n"
     << "dedup_bucket_us " << m.dedup_bucket_us << "\n"
-    << "dedup " << (m.dedup ? 1 : 0) << "\n";
+    << "dedup " << (m.dedup ? 1 : 0) << "\n"
+    << "checkpoint_every_events " << m.checkpoint_every_events << "\n"
+    << "late_out " << (m.late_out ? 1 : 0) << "\n"
+    << "input_size " << m.input.size << "\n"
+    << "input_head_fnv " << m.input.head_fnv << "\n"
+    << "input_tail_fnv " << m.input.tail_fnv << "\n";
   return o.str();
 }
 
@@ -275,7 +290,8 @@ Manifest parse_manifest(const std::string& text) {
   std::istringstream in(text);
   std::string line;
   if (!std::getline(in, line) || line != kManifestHeader) {
-    throw std::runtime_error("manifest: bad header");
+    throw std::runtime_error("manifest: bad header (expected '" + std::string(kManifestHeader) +
+                             "'; a checkpoint from an older streamkit cannot be resumed)");
   }
   std::map<std::string, std::string> kv;
   while (std::getline(in, line)) {
@@ -295,6 +311,18 @@ Manifest parse_manifest(const std::string& text) {
     }
     return v;
   };
+  // Hashes and sizes use the full unsigned range.
+  auto need_u64 = [&](const char* key) -> uint64_t {
+    auto it = kv.find(key);
+    if (it == kv.end()) throw std::runtime_error(std::string("manifest: missing ") + key);
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long v = std::strtoull(it->second.c_str(), &end, 10);
+    if (errno != 0 || end == it->second.c_str() || *end != '\0' || it->second[0] == '-') {
+      throw std::runtime_error(std::string("manifest: bad number for ") + key);
+    }
+    return v;
+  };
   Manifest m;
   m.epoch = static_cast<uint64_t>(need("epoch"));
   m.input_offset = static_cast<uint64_t>(need("input_offset"));
@@ -304,6 +332,12 @@ Manifest parse_manifest(const std::string& text) {
   m.lateness_us = need("lateness_us");
   m.dedup_bucket_us = need("dedup_bucket_us");
   m.dedup = need("dedup") != 0;
+  m.checkpoint_every_events = need_u64("checkpoint_every_events");
+  m.late_out = need("late_out") != 0;
+  m.input.size = need_u64("input_size");
+  m.input.head_fnv = need_u64("input_head_fnv");
+  m.input.tail_fnv = need_u64("input_tail_fnv");
+  if (m.checkpoint_every_events == 0) throw std::runtime_error("manifest: checkpoint_every_events must be >= 1");
   if (m.partitions == 0) throw std::runtime_error("manifest: partitions must be >= 1");
   return m;
 }
@@ -382,6 +416,45 @@ std::optional<Manifest> prepare_resume(const fs::path& ckpt_dir) {
     }
   }
   return committed;
+}
+
+void remove_checkpoint_dir(const fs::path& ckpt_dir, bool durable) {
+  std::error_code ec;
+  if (!fs::is_directory(ckpt_dir, ec)) return;
+  // 1. The commit record goes first, durably: from here on a crash leaves
+  //    "no MANIFEST", which prepare_resume() treats as "start over".
+  if (fs::remove(manifest_path(ckpt_dir), ec) && durable) durable_sync_dir(ckpt_dir);
+  if (ec) throw std::runtime_error("remove MANIFEST: " + ec.message());
+  // 2. Everything else, in whatever order the file system lists it.
+  fs::remove_all(ckpt_dir, ec);
+  if (ec) throw std::runtime_error("remove checkpoint dir: " + ec.message());
+}
+
+InputFingerprint fingerprint_input(int fd) {
+  struct stat st {};
+  if (::fstat(fd, &st) != 0) throw std::runtime_error(errno_text("fstat input"));
+  InputFingerprint f;
+  f.size = static_cast<uint64_t>(st.st_size);
+  constexpr uint64_t kBlock = 1 << 20;
+  const uint64_t n = f.size < kBlock ? f.size : kBlock;
+  std::vector<uint8_t> buf(static_cast<size_t>(n));
+  auto hash_at = [&](uint64_t offset) {
+    size_t got = 0;
+    while (got < n) {
+      const ssize_t r = ::pread(fd, buf.data() + got, static_cast<size_t>(n) - got,
+                                static_cast<off_t>(offset + got));
+      if (r < 0) {
+        if (errno == EINTR) continue;
+        throw std::runtime_error(errno_text("pread input"));
+      }
+      if (r == 0) throw std::runtime_error("input shrank while being fingerprinted");
+      got += static_cast<size_t>(r);
+    }
+    return fnv1a64(buf.data(), buf.size());
+  };
+  f.head_fnv = hash_at(0);
+  f.tail_fnv = hash_at(f.size - n);
+  return f;
 }
 
 // ---- coordinator -----------------------------------------------------------------

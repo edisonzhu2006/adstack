@@ -24,8 +24,12 @@ more, smaller reads; larger groups make each read efficient but force the
 scanner to read 64K values to use even one of them. 64K is the point where a
 wide column's chunk (64K * 8 B = 512 KiB) is already large enough that
 per-read overhead does not matter, and the footer stays tiny (153 groups,
-74 KB, 0.014% of the file at 10M rows). It is also what Parquet-style
-systems default to, so the comparison in m5 is fair. To tune it I would
+74 KB, 0.014% of the file at 10M rows). [Corrected 2026-10-24, see "Review fixes" at the end.] An earlier version of this
+paragraph said 64K rows is also what Parquet-style systems default to; it
+is not (parquet-mr defaults to 128 MB row groups, Arrow C++ to about 1M
+rows, DuckDB to 122,880 rows, ORC to 64 MB stripes with 10,000-row index
+strides), and nothing in the m5 comparison depends on it. 64K stands on
+the measurement plan that follows, not on a default. To tune it I would
 measure, for the three m4 benchmark queries, rows actually decoded versus
 rows that satisfied the filter, at 8K / 16K / 64K / 256K rows per group,
 plus footer bytes and open time. The knob is `ingest --row-group N`, so the
@@ -46,7 +50,11 @@ layout of `std::vector<int64_t>` is already the wire layout on every
 machine this runs on (arm64, x86-64). A `static_assert` on
 `std::endian::native` makes the assumption explicit; the alternative, a
 byte-by-byte encoder like `common/event.cpp`, is portable but 8x more loop
-iterations for no benefit here. Decoding a chunk is one `memcpy`.
+iterations for no benefit here. Decoding a PLAIN chunk into a typed array
+(`read_column<T>`) is one `memcpy`; [Corrected 2026-10-24, see "Review fixes" at the end.] the query scanner and verify decode
+into 64-bit patterns, which for PLAIN is one load-and-widen loop per chunk
+(`widen_bytes`); until 2026-10-24 that path went through a per-value
+switch and bounds check.
 
 **Encoding id per chunk, not per column or per file.** m2 will pick an
 encoding by looking at the data (dictionary for `country` and `device`,
@@ -209,7 +217,8 @@ DICT wins 16,396 vs 30,446. The selector found that; a rule table would
 have said "enum, use DICT" for both.
 
 **Ties go to PLAIN, then DELTA_BP, then the dictionary codecs.** Strictly
-smaller replaces the best so far. PLAIN decodes with one memcpy; DELTA_BP
+smaller replaces the best so far. PLAIN decodes with one memcpy into a
+typed array, or one widen loop into the 64-bit view the scanner uses; DELTA_BP
 is a dependent add per value; a dictionary lookup is a random access into
 a table. The tie order is also the trial order, which is what lets the
 delta size serve as the bar for the dictionary scan's early exit.
@@ -231,11 +240,16 @@ first run rather than after.
 count against the footer, header lengths, code width against dictionary
 size, codes against d, run lengths against the remaining rows, packed
 sections against remaining bytes, and no trailing bytes. `Codecs.EveryTruncationThrowsAndNeverCrashes` truncates each encoding at every length
-and expects an exception, under ASan. Narrowing a decoded 64-bit pattern
-back to a u8/u16/u32 column checks the high bits too, so a corrupt chunk
-cannot silently produce a wrong value. The cost is a branch per value on
-the decode path, which verify's 0.137 s of total decode time for 10M rows
-says is affordable.
+and expects an exception, under ASan. [Corrected 2026-10-24, see "Review fixes" at the end.] This paragraph used to end
+"narrowing a decoded 64-bit pattern back to a u8/u16/u32 column checks the
+high bits too, so a corrupt chunk cannot silently produce a wrong value".
+That was false: the width check existed only in `read_column<T>`, the
+query scanner and verify never narrow, and the format had no checksum, so
+one flipped bit in a DELTA_BP chunk produced `max(campaign_id) =
+549755913527` for a u32 column with exit 0. Structural validation cannot
+catch a flipped value bit at all. Format version 3 now stores a CRC-32C per
+chunk and for the footer, checked on every read, and DELTA_BP decoding
+checks the value width for narrow columns; the review entry has the cost.
 
 **`--encoding plain` kept as a writer policy.** The PLAIN baseline in
 every table is produced by the same binary and the same run, and the
@@ -297,16 +311,17 @@ whole row group at a time.** Row-at-a-time execution pays the operator
 dispatch (here: slicing ten column pointers, resetting the selection
 vector, looping over the predicate list) per row, and the per-row compare
 cannot be unrolled or kept in registers across rows. Measured with the
-`--vector` knob, which runs the same operators at any batch size (1 is
-literally row-at-a-time): P3 takes 0.137 s at 1, 0.068 s at 16, 0.065 s at
+`--vector` knob, which runs the same filter at any batch size (1 means
+row-at-a-time FILTER dispatch; decode is always a whole chunk, so this is
+not a row-at-a-time engine, [Corrected 2026-10-24, see "Review fixes" at the end.]): P3 takes 0.137 s at 1, 0.068 s at 16, 0.065 s at
 128, 0.062 s at 1024 and 0.062 s at 65,536. So 2.2x from batching, saturated
 by 128, and no penalty yet for a whole row group. 1024 is still the default
-because 1024 values * 8 B = 8 KiB per column keeps a handful of columns
-resident in L1 while the next operator (m4's hash aggregate, which re-reads
-the batch through the selection vector) consumes them; at 65,536 the
-projected columns of one batch are 1 MB and every re-read comes from L2.
-That claim is for m4 to measure; m3 only shows that nothing is lost at
-1024. Why not smaller: at 16 the dispatch cost is already visible (10%).
+because it is the smallest size at which dispatch cost is gone. The L1
+argument once given here (8 KiB per column of a batch stays resident) does
+not apply to this code: a batch is a window into a 512 KiB chunk that was
+already decoded in full, so batch size does not change what is decoded or
+where it sits in the cache, which is why 65,536 costs nothing (m4
+measured no effect either). Why not smaller: at 16 the dispatch cost is already visible (10%).
 
 **Selection vector instead of a materialized copy or a bitmap.** The
 filter writes the indices of passing rows into `sel` and the consumer
@@ -349,10 +364,12 @@ Measured skipping on `event_time_us`: a 10 s range scans 7 groups of 153,
 60 s scans 15, 300 s scans 52. The ideal is 2, 10 and 46 (a group holds
 6.55 s of ingest at 10K events/s). The gap is the late events: 5% of rows
 are up to 30 s late, so every group's `min` is about 30 s below its ingest
-window and each group spans about 36 s, not 6.55 s. The formula
-`ceil((range + 30) / 6.55) + 1` gives 7, 15, 52, which is exactly what is
-measured, so the overhead is a constant 5 groups per query, not a fraction
-of the data. The fix, if a workload cared, is sorting each row group by
+window and each group spans about 36 s, not 6.55 s, so the late window
+alone is worth 30 / 6.55 = 4.6 groups. [Corrected 2026-10-24, see "Review fixes" at the end.] Measured overhead over the
+ideal is 5, 5 and 6 groups (7 - 2, 15 - 10, 52 - 46): about five groups
+per query whatever the range, not a fraction of the data. (The formula
+first written here, `ceil((range + 30) / 6.55) + 1`, gives 8, 15, 52 and
+so does not reproduce the 10 s case.) The fix, if a workload cared, is sorting each row group by
 `event_time_us` at ingest, which costs a sort per 64K rows and would
 scramble the arrival-order columns that compress best today
 (`ingest_time_us` is 60x because consecutive deltas are all 100 us); not
@@ -477,10 +494,11 @@ power-of-two array of 24-byte slots (16-byte key, 4-byte group index, 4
 bytes padding); a hit is one memory access, and a probe count is exposed
 so the cost is a number, not a feeling: 1.32 probes per row on Q2 and Q3
 (100,000 groups in 262,144 slots, load 0.38, after 8 doublings from
-1,024). Measured on Q3: decoding the three columns alone is 0.055 s,
-`GROUP BY campaign_id` with a bare `count()` is 0.104 s, so the lookup
-costs about 5 ns per row, and the four aggregates add 0.073 s, 1.8 ns per
-row per aggregate. The table maps a key to a dense GROUP INDEX and knows
+1,024). [Corrected 2026-10-24, see "Review fixes" at the end.] The breakdown first written here (decode 0.055 s, bare
+`count()` 0.104 s, "so the lookup costs about 5 ns per row") subtracted a
+three-column decode from a query that decodes one column, and the "1.8 ns
+per aggregate" figure inherited the error; the review entry redoes it with
+matched baselines. The table maps a key to a dense GROUP INDEX and knows
 nothing about aggregates; the aggregate state lives in a flat `uint64_t`
 array, `n_aggs` cells per group. That split is what makes each aggregate's
 update a plain array loop and the thread merge a loop over one table's
@@ -528,16 +546,16 @@ to group indices (one probe per selected row, kept in a vector), and
 then each aggregate runs its own loop over the batch with the kind
 switched once outside the loop. The group-index vector is 4 KB per
 batch and stays in L1 across the aggregate loops. `count_if` adds 0 or 1
-without a branch, the same reasoning as the m3 selection vector. The
-per-aggregate cost of 1.8 ns per row is the random write into the state
-array (a group's cells are adjacent, so the four aggregates of one row
-touch one or two cache lines).
+without a branch, the same reasoning as the m3 selection vector. [Corrected 2026-10-24, see "Review fixes" at the end.] The
+claim that followed here, that the per-aggregate cost is the random write
+into the state array, is refuted by measurement: the same four aggregates
+cost about the same with 3 groups (all state in L1) as with 100,000; the
+review entry has the numbers.
 
 **Conditional aggregates (`count_if`, `sum_if`) instead of running Q3
 as three filtered queries.** Three queries would decode `campaign_id` and
 `cost_micros` three times and probe the table three times; the
-conditional aggregates read `event_type` once and cost 1.8 ns per row
-each, so Q3 is one scan at 0.177 s instead of roughly three at 0.104 s.
+conditional aggregates read `event_type` once, so Q3 is one scan at 0.177 s instead of roughly three at 0.104 s.
 The condition is one `--where` term reusing the parser and
 `Predicate::matches`, so `count_if(cost_micros BETWEEN 1 AND 9)` works
 without new code. This is SQL's `FILTER (WHERE ...)`.
@@ -567,8 +585,12 @@ appends the group columns to the ORDER BY, so the output is a function
 of the data and not of which thread saw a group first;
 `QueryFiles.ThreadsDoNotChangeTheAnswer` compares the emitted rows at 1,
 2, 3, 5 and 17 threads (17 is more threads than row groups, so some are
-idle). Without ORDER BY or LIMIT the rows come out in first-seen order
-and nothing is sorted, which is also what SQL promises.
+idle). Without ORDER BY or LIMIT nothing is sorted and the rows come out
+in first-seen order at one thread; at T threads thread 0's groups come
+first, so the order depends on T. SQL guarantees no order here, so this is
+allowed, but it is not "what SQL promises" as this sentence used to say.
+With a LIMIT and no ORDER BY the rows are ordered by the group columns
+ascending (the appended tiebreak).
 
 **Threads: row groups interleaved, one reader and one table per thread,
 serial merge.** Thread t of T scans row groups t, t + T, ...; interleaving
@@ -840,9 +862,12 @@ then was the single-process binary or serial ctest. Fix: every temp name
 now carries a per-process token drawn once from `std::random_device`
 (64 bits, so a collision between two concurrent test processes is not a
 realistic event). Alternatives: `getpid()` is the conventional answer and
-would have been one line, but it is POSIX and the project rule is standard
-library only, and the rule is cheaper to keep than to explain an
-exception to; a per-TEST unique name (counter) would not help, because the
+would have been one line. [Corrected 2026-10-24, see "Review fixes" at the end.] The reason first given here, that getpid
+is POSIX and the project is standard library only, does not hold: colstore
+links `common/`, whose `event.cpp` already uses `<unistd.h>`/`<fcntl.h>`
+(`fsync`, `F_FULLFSYNC`). The real reason to keep `std::random_device` is
+smaller: it needs no platform header in the tests and its 64 bits are
+unique across processes, which is the property needed; a per-TEST unique name (counter) would not help, because the
 colliding tests are the same test code in different processes. `std::tmpfile`
 cannot be used because the code under test opens files by path. Cost:
 one `std::to_string` per process. Verified: 8 consecutive `ctest -j 8`
