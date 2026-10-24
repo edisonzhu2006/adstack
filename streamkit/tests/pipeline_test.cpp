@@ -3,6 +3,8 @@
 // the whole reader + workers + merge path on a small file at several thread
 // counts, checked against a brute-force recompute done in the test.
 
+#include <initializer_list>
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -411,7 +413,8 @@ TEST(Pipeline, ExtremeEventTimesFailLoudlyInsteadOfOverflowing) {
   // silently diverted as late. Both were signed overflow, i.e. undefined
   // behaviour. Now the record is rejected by name before any arithmetic.
   // Run under the ASan+UBSan build this test must also print no UBSan report.
-  for (const int64_t t : {LLONG_MIN + 5, LLONG_MAX - 5, kMaxAbsEventTimeUs + 1, -kMaxAbsEventTimeUs - 1}) {
+  for (const int64_t t : std::initializer_list<int64_t>{LLONG_MIN + 5, LLONG_MAX - 5, kMaxAbsEventTimeUs + 1,
+                                                        -kMaxAbsEventTimeUs - 1}) {
     for (const int64_t lateness_s : {int64_t{0}, int64_t{60}}) {
       const std::string in = scratch("extreme.ads");
       write_events(in, {make(41, t, 7), make(42, 0, 7)});

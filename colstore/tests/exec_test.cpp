@@ -47,7 +47,9 @@ Result run(const ColReader& r, const Conjunction& where, const std::vector<Colum
     for (uint32_t k = 0; k < b.selected(); ++k) {
       const uint32_t i = b.row(k);
       EXPECT_LT(i, b.n);
-      if (k > 0) EXPECT_GT(i, prev) << "selection vector must be strictly ascending";
+      if (k > 0) {
+        EXPECT_GT(i, prev) << "selection vector must be strictly ascending";
+      }
       prev = i;
       out.rows.push_back(base + b.first_row + i);
     }

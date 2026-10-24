@@ -10,8 +10,8 @@
 //   cost_micros  = bytes added (length.new - length.old)
 //   event_id     = hash(meta.id)            (stable uuid => replays dedup correctly)
 //
-//   curl -sN https://stream.wikimedia.org/v2/stream/recentchange \
-//     | wiki2events --out - | streamkit --in - --out live.csv --window-s 10 --lateness-s 5
+//   curl -sN https://stream.wikimedia.org/v2/stream/recentchange |
+//       wiki2events --out - | streamkit --in - --out live.csv --window-s 10 --lateness-s 5
 
 #include <chrono>
 #include <cstdio>

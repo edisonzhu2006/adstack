@@ -323,7 +323,9 @@ TEST(Coordinator, LastArriverCommitsAndDeletesPreviousEpoch) {
     EXPECT_EQ(c.stats().last_input_offset, 1000 * epoch);
     EXPECT_EQ(c.stats().last_snapshot_bytes, 30u);
     EXPECT_EQ(parse_manifest(slurp(manifest_path(d))).epoch, epoch);
-    if (epoch > 1) EXPECT_FALSE(fs::exists(epoch_dir(d, epoch - 1)));
+    if (epoch > 1) {
+      EXPECT_FALSE(fs::exists(epoch_dir(d, epoch - 1)));
+    }
     EXPECT_TRUE(fs::exists(epoch_dir(d, epoch)));
   }
   EXPECT_FALSE(fs::exists(d / "manifest.tmp"));

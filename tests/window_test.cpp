@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <initializer_list>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -49,7 +50,7 @@ TEST(Agg, CountsByTypeAndSumsCost) {
 // ---- sliding windows (m3) ---------------------------------------------------
 
 TEST(Sliding, TumblingIsTheSpecialCaseSlideEqualsWindow) {
-  for (int64_t t : {0LL, 1LL, kMin - 1, kMin, 7 * kMin + 42, -1LL, -kMin - 1}) {
+  for (int64_t t : std::initializer_list<int64_t>{0, 1, kMin - 1, kMin, 7 * kMin + 42, -1, -kMin - 1}) {
     const auto starts = window_starts(t, kMin, kMin);
     ASSERT_EQ(starts.size(), 1u) << "t=" << t;
     EXPECT_EQ(starts[0], window_start(t, kMin)) << "t=" << t;
@@ -60,7 +61,7 @@ TEST(Sliding, EventBelongsToWindowOverSlideWindows) {
   // window 300s, slide 60s: every event is in exactly 5 windows, 60s apart,
   // the last of which starts at floor(t, 60s).
   const int64_t w = 5 * kMin, sl = kMin;
-  for (int64_t t : {0LL, 59LL * 1'000'000, kMin, 10 * kMin + 1, 1'000 * kMin - 1}) {
+  for (int64_t t : std::initializer_list<int64_t>{0, 59 * 1'000'000, kMin, 10 * kMin + 1, 1'000 * kMin - 1}) {
     const auto starts = window_starts(t, w, sl);
     ASSERT_EQ(starts.size(), 5u) << "t=" << t;
     EXPECT_EQ(starts.back(), window_start(t, sl));
@@ -139,7 +140,9 @@ TEST(Range, WindowEnumerationAtTheLimitsTerminatesWithoutOverflow) {
     for (size_t i = 0; i < starts.size(); ++i) {
       EXPECT_LE(starts[i], t);
       EXPECT_GT(starts[i] + kMaxDurationUs, t);
-      if (i > 0) EXPECT_EQ(starts[i] - starts[i - 1], slide);
+      if (i > 0) {
+        EXPECT_EQ(starts[i] - starts[i - 1], slide);
+      }
     }
   }
 }
